@@ -1,0 +1,159 @@
+我的方案：
+# **程序存活竞赛方案设计文档**
+
+## 1. 项目概览
+
+| 模块名称              | 类型      | 功能定位                                                |
+| ----------------- | ------- | --------------------------------------------------- |
+| **xx.exe**        | 主进程     | 用户态入口，加载守护模块与攻击模块，维护日志中心                            |
+| **svcguard.dll**    | 守护模块    | 自我复活与扩散，每 500ms 扫描新进程并注入自己，旧实例自动释放                     |
+| **window.dll**    | 弹窗与日志模块 | 显示全局日志并证明程序存活，支持多进程冗余与自动重建                          |
+| **atkcore.dll** | 攻击工具箱   | 提供动态调用接口，对对方进程执行结束操作                                |
+| **payload.dll**    | 攻击载荷    | 注入对方进程执行自定义载荷（结束自身进程）                            |
+| **guard.dll**     | 进程看门狗   | 读取 xpt.xpt，监控并复活受保护进程、恢复被挂起线程                          |
+| **defense.dll**   | 合并防御模块  | 合并 xx 原有防御与新 yy 的防御：敌人文件锁/设备锁/VEH自愈/LdrLoadDll反注入/心跳看门狗 |
+
+---
+
+## 2. 核心策略
+
+1. **弹窗存活优先**
+
+   * 胜负判定依据 `window.dll` 弹窗是否连续消失 8 秒。
+   * 采用多进程冗余机制，确保窗口至少有一个实例存活。
+
+2. **DLL 自我扩散**
+
+   * 每 500ms 扫描系统进程，向新进程注入自身（注入结果缓存 10s）。
+   * 旧的 DLL 自动退出释放资源，防止资源泄漏。
+
+3. **守护与复活机制**
+
+   * `svcguard.dll` 监控 `xx.exe` 心跳（超时 500ms 即复活）；`window.dll` 通过互斥锁热备在其他进程重建弹窗并拉起 `xx.exe`。
+   * 弹窗被关闭或宿主进程被结束时，快速在其他进程重建。
+
+4. **攻击能力**
+
+   * `atkcore.dll` 提供 5 种用户态进程结束方法：
+
+     1. TerminateProcess
+     2. CreateRemoteThread + ExitProcess
+     3. 注入 `payload.dll`
+     4. 注入 `payload.bin`（位置无关 shellcode，可绕过签名检查）
+     5. Job 对象终止
+   * `payload.dll` 执行自定义载荷逻辑，按需加载。
+
+---
+
+## 3. 模块详细设计
+
+### 3.1 xx.exe（主进程）
+
+* 进程入口先提权：`EnableDebugPrivilege` 启用 `SeDebugPrivilege`（`AdjustTokenPrivileges`），供跨进程句柄打开、注入与击杀使用。
+* 一运行就创建 3 个线程：
+  1. `AttackThread`：加载 `atkcore.dll` 并调用 `StartAttack`，同时定向关闭 `yy.exe` / `ww.exe` 窗口并重建同名假窗口。
+  2. `InitThread`：设置安全描述符 → 初始化共享内存与心跳后缀 → 创建 WMI 永久订阅 → 依次加载 `svcguard.dll` / `guard.dll` / `window.dll` / `defense.dll`。
+  3. `SelfProtectThread`：持续维护 `xxres.bin` 自身备份，供文件被删后还原。
+* 提供全局日志服务，供 `window.dll` 显示。
+* 内置自我保护逻辑，尝试恢复已被结束的子模块。
+
+### 3.2 svcguard.dll（守护模块）
+
+* 进程入口先提权：`EnableDebugPrivilege` 启用 `SeDebugPrivilege`。
+* 每 500ms 扫描系统新进程，注入自身和 `window.dll`（带 10s 注入缓存，避免重复扫描与重复注入）。
+* 跳过关键系统进程（`IsProtected` 黑名单）。
+* 对宿主进程被结束或崩溃做自动复活：`WaitForSingleObject(心跳事件, 500ms)` 超时即 `RespawnXX`（已有实例在跑则跳过），随后 `FreeLibraryAndExitThread` 释放本实例。
+* 卸载对手注入的 `guard.dll`（仅保留与我方同目录的那一份）。
+* 自动管理旧的 DLL 实例，释放资源后退出。
+
+### 3.4 window.dll（弹窗模块）
+
+* **多实例冗余**：在不同进程保持弹窗至少一个存活（`Global\xx_window_guard` 互斥锁热备循环）。
+* **全局唯一标识**：共享内存或全局信号量记录窗口句柄，防止重复显示。
+* **日志显示**：弹窗读取全局日志，显示主程序及守护模块信息。
+* **自动重建**：弹窗被关闭或宿主进程结束，立即在新进程创建新窗口。
+* **窗口类名**：`XX_ALIVE_WND_{共享内存后缀}`，除非与其共享内存，否则无法获得准确类目，杜绝假窗口。
+* **拒绝一切可拒绝的 WM 消息**：`WndProc` 采用白名单放行（绘制 / 布局 / 鼠标 / 焦点 / 显示等必需消息走 `DefWindowProc`，其余一律 `return 0`）；消息循环额外吞掉外部投递的 `WM_QUIT`（仅自身 `DLL_PROCESS_DETACH` 退出时放行），避免对手 `PostMessage(WM_QUIT)` 让 `GetMessage` 返回 0 结束循环导致弹窗消失。
+
+### 3.5 atkcore.dll（攻击工具箱）
+
+* 进程入口先提权：`EnableDebugPrivilege` 启用 `SeDebugPrivilege`。
+* 导出 `StartAttack`，本身不自启；由 `xx.exe`（`AttackThread`）或 `svcguard.dll`（`StartRemoteAttack`）调用后启动 `AttackLoop`。
+* `TryAllMethods` 按顺序尝试 5 种方法：TerminateProcess → CreateRemoteThread+ExitProcess → payload.dll → payload.bin → Job。
+* 对 `yy.exe` 用 APC 注入 payload.bin 绕过签名检查；对宿主进程用 CreateRemoteThread。
+* 定向关闭 `yy.exe` / `ww.exe` 窗口并用同名同标题重建 1×1 假窗口（实现位于 `xx.c` 的 `AttackThread`，不在本模块）。
+
+### 3.6 payload.dll（攻击载荷）
+
+* 由 `atkcore.dll` 注入目标进程。
+* 执行载荷：在目标进程内结束自身（`TerminateProcess` + `ExitProcess`）；若目标是 `xx.exe` 则直接跳过。
+* 保证攻击模块可动态调用，独立于守护逻辑。
+
+### 3.7 defense.dll（合并防御模块）
+
+* 由 `xx.exe` 动态 `LoadLibrary` 导入，并在新线程执行导出函数 `StartDefense`（WINAPI）。
+* 合并 xx 原有防御 + 新 yy 的全部防御手段，只运行在 xx 自身进程内：
+  * 敌人二进制独占锁（`yy.exe` / `lenovo_fix.exe` / `guard.dll` 等）
+  * BYOVD 设备符号链接锁（`\\.\BootRepair` / `kdmapper` / `kdu` / `GIO`）
+  * VEH 冷镜像自愈（拦截 .text 被写 `0xCC`）
+  * `kernel32!TerminateProcess` 字节还原
+  * `LdrLoadDll` 反注入 Hook（trampoline 实现，同名 `guard.dll` 用路径放行我方）
+  * 心跳看门狗（掉线则从 `xxres.bin` 还原并拉起 `xx.exe`）
+* 刻意不装 `NtCreateThreadEx` / `NtQueueApcThread` Hook：本地 hook 拦不到“别人往我这儿建线程”，只会干扰 xx 自己。
+* 导出全部函数（`-Wl,--export-all-symbols`），主入口 `StartDefense`。
+
+---
+
+## 4. DLL 扩散与管理策略
+
+1. **扫描与注入**
+
+   * 每 500ms 扫描系统进程列表（注入结果缓存 10s，避免重复扫描开销）。
+   * 避免重复注入已有模块实例。
+   * 跳过关键系统进程（`IsProtected` 黑名单），提高稳定性。
+
+2. **旧实例释放**
+
+   * 每个 svcguard.dll 实例都必须独立监控心跳事件，一旦超时 500ms，立即执行复活（已有实例在运行则跳过），然后自身 FreeLibraryAndExitThread，绝不阻挠复活触发。
+   * 防止过多实例占用资源。
+
+3. **弹窗存活保障**
+
+   * 弹窗实例分布在多个进程。
+
+---
+
+## 5. 胜负判定优化
+
+* **存活标准**：至少一个 `window.dll` 弹窗在屏幕上显示且持续更新日志。
+* **失败条件**：弹窗连续消失超过 8 秒，判定该程序出局。
+* **恢复机制**：window.dll 创建 Global\xx_heartbeat_{唯一后缀}，每500ms SetEvent。svcguard.dll 调用 WaitForSingleObject(event, 500)（`HEARTBEAT_TIMEOUT=500`），超时就启动复活流程。
+
+---
+
+## 6. 规则合规性说明
+
+* **EXE 数量**：仅提交 `xx.exe`，符合“一人一个 EXE”要求。
+* **DLL 使用**：支持多个 DLL 扩散，无需内核驱动。
+* **调试特权**（新约定，已允许）：`xx.exe` / `svcguard.dll` / `atkcore.dll` 在进程入口调用 `EnableDebugPrivilege` 启用 `SeDebugPrivilege`（`AdjustTokenPrivileges`），用于跨进程句柄打开、跨会话注入与击杀。
+* **存活证明**：弹窗显示全局日志，证明程序活跃。
+* **提交内容透明**：提供 EXE 与 DLL 列表及日志显示方法。
+
+---
+
+## 7. 架构流程图（文字版）
+
+```text
+xx.exe
+│
+├──> svcguard.dll (守护与扩散)
+│       ├──> window.dll (弹窗与日志)
+│       └──> 注入其他进程
+│             └──> window.dll (冗余弹窗)
+│
+├──> atkcore.dll (攻击工具箱)
+│       └──> payload.dll (攻击载荷)
+│
+├──> defense.dll (合并防御，StartDefense)
+│
+```
