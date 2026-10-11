@@ -6,11 +6,11 @@
 | 模块名称              | 类型      | 功能定位                                                |
 | ----------------- | ------- | --------------------------------------------------- |
 | **xx.exe**        | 主进程     | 用户态入口，加载守护模块与攻击模块，维护日志中心                            |
-| **svcguard.dll**    | 守护模块    | 自我复活与扩散，每 500ms 扫描新进程并注入自己，旧实例自动释放                     |
+| **svcguard.dll**    | 守护模块    | 自我复活与扩散（仅本会话），部署 guard.dll 宿主并交接 xx 进程句柄，按心跳计数器复活 xx |
 | **window.dll**    | 弹窗与日志模块 | 显示全局日志并证明程序存活，支持多进程冗余与自动重建                          |
 | **atkcore.dll** | 攻击工具箱   | 提供动态调用接口，对对方进程执行结束操作                                |
 | **payload.dll**    | 攻击载荷    | 注入对方进程执行自定义载荷（结束自身进程）                            |
-| **guard.dll**     | 进程看门狗   | 读取 xpt.xpt，监控并复活受保护进程、恢复被挂起线程                          |
+| **guard.dll**     | 进程看门狗   | 由 svcguard 注入宿主进程运行（xx 不加载自己），读取 xpt.xpt，监控并复活受保护进程、恢复被挂起线程 |
 | **defense.dll**   | 合并防御模块  | 合并 xx 原有防御与新 yy 的防御：敌人文件锁/设备锁/VEH自愈/LdrLoadDll反注入/心跳看门狗 |
 
 ---
@@ -24,13 +24,15 @@
 
 2. **DLL 自我扩散**
 
-   * 每 500ms 扫描系统进程，向新进程注入自身（注入结果缓存 10s）。
+   * 每 500ms 扫描**本会话**进程，向新进程注入自身（注入结果缓存 10s）。
    * 旧的 DLL 自动退出释放资源，防止资源泄漏。
 
 3. **守护与复活机制**
 
-   * `svcguard.dll` 监控 `xx.exe` 心跳（超时 500ms 即复活）；`window.dll` 通过互斥锁热备在其他进程重建弹窗并拉起 `xx.exe`。
-   * 弹窗被关闭或宿主进程被结束时，快速在其他进程重建。
+   * 弹窗存活判据 = 共享内存心跳计数器：持有弹窗的 `window.dll` 实例每 500ms 递增一次，能看到本桌面弹窗的热备实例也帮忙递增。
+   * `svcguard.dll` / `defense.dll` 每 500ms 轮询该计数器，连续 2.5 秒不涨即尝试复活 `xx.exe`（命名互斥锁串行化，已有实例在跑则跳过；不再自我卸载）。
+   * `window.dll` 通过 `Local\xx_window_guard`（单会话）互斥锁热备；抢不到锁时若本桌面 1.5 秒看不到任何 XX 弹窗，就无视锁强建弹窗。
+   * 弹窗被关闭或宿主进程被结束时，快速在其他宿主进程重建。
 
 4. **攻击能力**
 
@@ -52,7 +54,7 @@
 * 进程入口先提权：`EnableDebugPrivilege` 启用 `SeDebugPrivilege`（`AdjustTokenPrivileges`），供跨进程句柄打开、注入与击杀使用。
 * 一运行就创建 3 个线程：
   1. `AttackThread`：加载 `atkcore.dll` 并调用 `StartAttack`，同时定向关闭 `yy.exe` / `ww.exe` 窗口并重建同名假窗口。
-  2. `InitThread`：设置安全描述符 → 初始化共享内存与心跳后缀 → 创建 WMI 永久订阅 → 依次加载 `svcguard.dll` / `guard.dll` / `window.dll` / `defense.dll`。
+  2. `InitThread`：设置安全描述符 → 初始化/接管共享内存（写布局版本与启动 tag，沿用或生成心跳/窗口后缀）→ 加载 `svcguard.dll` → 加载 `window.dll`（刻意排在 WMI 之前）→ 写 `xpt.xpt` → 创建 WMI 永久订阅 → 加载 `defense.dll`（`guard.dll` 改由 svcguard 注入宿主，不在 xx 内加载）。
   3. `SelfProtectThread`：持续维护 `xxres.bin` 自身备份，供文件被删后还原。
 * 提供全局日志服务，供 `window.dll` 显示。
 * 内置自我保护逻辑，尝试恢复已被结束的子模块。
@@ -60,20 +62,24 @@
 ### 3.2 svcguard.dll（守护模块）
 
 * 进程入口先提权：`EnableDebugPrivilege` 启用 `SeDebugPrivilege`。
-* 每 500ms 扫描系统新进程，注入自身和 `window.dll`（带 10s 注入缓存，避免重复扫描与重复注入）。
-* 跳过关键系统进程（`IsProtected` 黑名单）。
-* 对宿主进程被结束或崩溃做自动复活：`WaitForSingleObject(心跳事件, 500ms)` 超时即 `RespawnXX`（已有实例在跑则跳过），随后 `FreeLibraryAndExitThread` 释放本实例。
+* 每 500ms 扫描**本会话**新进程，注入自身和 `window.dll`（带 10s 注入缓存，避免重复扫描与重复注入）；跨会话不扩散（弹窗锁是 `Local\`，注入到别的会话只会造出看不见的影子实例）。
+* 跳过关键系统进程（`IsProtected` 黑名单，含 `notepad.exe`）。
+* 心跳计数器连续 2.5 秒不涨即 `RespawnXX`（命名互斥锁 `Global\xx_respawn_guard` 串行化；已有实例在跑则跳过）。**不再** `FreeLibraryAndExitThread`：那会把同一模块里正在跑的注入扫描线程一起掀掉。
+* 部署 `guard.dll` 到最多 4 个同会话宿主进程，并用 `DuplicateHandle` 把 xx 自己的进程句柄复制进宿主、登记到共享内存句柄表（见 3.8）。
 * 卸载对手注入的 `guard.dll`（仅保留与我方同目录的那一份）。
-* 自动管理旧的 DLL 实例，释放资源后退出。
+* 实例常驻：只做复活，不自我卸载（见 §4.2）。
 
 ### 3.4 window.dll（弹窗模块）
 
-* **多实例冗余**：在不同进程保持弹窗至少一个存活（`Global\xx_window_guard` 互斥锁热备循环）。
-* **全局唯一标识**：共享内存或全局信号量记录窗口句柄，防止重复显示。
-* **日志显示**：弹窗读取全局日志，显示主程序及守护模块信息。
+* **多实例冗余**：在不同进程保持弹窗至少一个存活（`Local\xx_window_guard` 单会话互斥锁热备循环）。
+* **兜底强建**：抢不到锁（例如被对手进程长期持有）时，只要本桌面连续 1.5 秒看不到任何 `XX_ALIVE_WND_*` 窗口，就无视锁自己建窗；建窗前先抢 `Local\xx_window_make_guard` 并复查一次，避免多个热备实例在同一 tick 各建一个重复弹窗。
+* **线程自愈**：导出 `StartWindow`，供 svcguard 用远程线程在宿主进程里重新拉起被 `TerminateThread` / 已退出的弹窗线程（每进程最多 4 个弹窗线程）。
+* **心跳**：弹窗每 500ms 递增共享内存心跳计数器；能看到本桌面弹窗的热备实例也帮忙递增（持有者被冻结时仍不误判）。
+* **窗口类名**：`XX_ALIVE_WND_{共享内存后缀}`（后缀由 xx.exe 生成并跨复活沿用），除非与其共享内存，否则无法获得准确类目，杜绝假窗口。
+* **日志显示**：弹窗读取共享内存全局日志，**控制台式滚动输出**（450×325 窗口，按字体行高铺满，最新一行贴底，只在日志变化时重画）；行首表用环形缓冲只保留最后若干行，避免"日志一长画面就停住、写满了才跳一次"。
 * **自动重建**：弹窗被关闭或宿主进程结束，立即在新进程创建新窗口。
-* **窗口类名**：`XX_ALIVE_WND_{共享内存后缀}`，除非与其共享内存，否则无法获得准确类目，杜绝假窗口。
-* **拒绝一切可拒绝的 WM 消息**：`WndProc` 采用白名单放行（绘制 / 布局 / 鼠标 / 焦点 / 显示等必需消息走 `DefWindowProc`，其余一律 `return 0`）；消息循环额外吞掉外部投递的 `WM_QUIT`（仅自身 `DLL_PROCESS_DETACH` 退出时放行），避免对手 `PostMessage(WM_QUIT)` 让 `GetMessage` 返回 0 结束循环导致弹窗消失。
+* **拒绝一切可拒绝的 WM 消息**：`WndProc` 采用白名单放行（绘制 / 布局 / 鼠标 / 焦点 / 显示等必需消息走 `DefWindowProc`，其余一律 `return 0`）；消息循环额外吞掉外部投递的 `WM_QUIT`；`WM_DESTROY` 一律拒绝（外部投递的 `WM_DESTROY` 只是普通消息，真销毁时 `DestroyWindow` 必定补发 `WM_NCDESTROY`），收尾动作全部放在 `WM_NCDESTROY`。
+* 初始化失败（共享内存/后缀尚未就绪）时**重试等待**而不是永久退出该实例。
 
 ### 3.5 atkcore.dll（攻击工具箱）
 
@@ -102,20 +108,29 @@
 * 刻意不装 `NtCreateThreadEx` / `NtQueueApcThread` Hook：本地 hook 拦不到“别人往我这儿建线程”，只会干扰 xx 自己。
 * 导出全部函数（`-Wl,--export-all-symbols`），主入口 `StartDefense`。
 
+### 3.8 guard.dll 的宿主化与句柄交接
+
+* `xx.exe` **不再** `LoadLibrary` 加载 `guard.dll`：xx 一旦被结束，装在它里面的 guard 会一起死，来不及复活 xx；而且对手会先挂起 xx 的所有线程，进程内的 guard 同样被挂起，什么也做不了。
+* 改为由"跑在 xx.exe 内的 svcguard 实例"把 `guard.dll` 注入最多 4 个**同会话**宿主（优先 `explorer.exe`），宿主消失或模块被卸时自动补部署。
+* 注入的同时用 `DuplicateHandle` 把 **xx 自己的进程句柄**（权限仅 `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`）复制进宿主进程，按宿主 PID 登记到共享内存句柄表（条目含启动 tag 与"句柄指向的 xx PID"，xx 重启后旧条目自动失效；宿主还在就每轮重发，发不进去就改投其它宿主）。
+* 源句柄是 xx 在**收紧 DACL 之前**打开、写进共享内存 `OFFSET_SELF_HANDLE` 槽位的那个；现场 `OpenProcess` 只是后备。伪句柄不能跨进程复制，因此不做那种"退化"。
+* 宿主里的 `guard.dll` 按自己的 PID 取出该句柄，先用 `GetProcessId` 校验它确实指向记录里的进程，再用 `WaitForSingleObject` 判活，**完全不调用 `OpenProcess`**。找不到句柄时退化为 `OpenProcess` + 进程名快照判活。
+
 ---
 
 ## 4. DLL 扩散与管理策略
 
 1. **扫描与注入**
 
-   * 每 500ms 扫描系统进程列表（注入结果缓存 10s，避免重复扫描开销）。
+   * 每 500ms 扫描**本会话**进程列表（注入结果缓存 10s，避免重复扫描开销）。
    * 避免重复注入已有模块实例。
-   * 跳过关键系统进程（`IsProtected` 黑名单），提高稳定性。
+   * 跳过关键系统进程（`IsProtected` 黑名单，含 `notepad.exe`），提高稳定性。
+   * 额外把 `guard.dll` 注入最多 4 个同会话宿主，并交接 xx 进程句柄（§3.8）。
 
-2. **旧实例释放**
+2. **实例管理**
 
-   * 每个 svcguard.dll 实例都必须独立监控心跳事件，一旦超时 500ms，立即执行复活（已有实例在运行则跳过），然后自身 FreeLibraryAndExitThread，绝不阻挠复活触发。
-   * 防止过多实例占用资源。
+   * 每个 svcguard.dll 实例独立轮询心跳计数器并各自尝试复活（命名互斥锁串行化、已有 xx 实例则跳过），**不再自我卸载**：原实现超时即 `FreeLibraryAndExitThread`，会把同一模块里正在跑的注入扫描线程一起掀掉，而手动重置事件又让"超时"根本不会发生。
+   * 靠 10s 注入缓存与"已含我方模块则跳过"避免重复注入与资源膨胀。
 
 3. **弹窗存活保障**
 
@@ -125,9 +140,14 @@
 
 ## 5. 胜负判定优化
 
-* **存活标准**：至少一个 `window.dll` 弹窗在屏幕上显示且持续更新日志。
+* **存活标准**：至少一个 `window.dll` 弹窗在**本会话桌面**上显示且持续更新日志。
 * **失败条件**：弹窗连续消失超过 8 秒，判定该程序出局。
-* **恢复机制**：window.dll 创建 Global\xx_heartbeat_{唯一后缀}，每500ms SetEvent。svcguard.dll 调用 WaitForSingleObject(event, 500)（`HEARTBEAT_TIMEOUT=500`），超时就启动复活流程。
+* **恢复机制**：共享内存心跳计数器（`xxipc.h` 的 `OFFSET_HB_TICK`）由弹窗每 500ms 递增一次；`svcguard.dll` / `defense.dll` 每 500ms 轮询，连续 2.5 秒不涨即进入恢复流程（动作按 10 秒节流）：
+  1. 本进程（xx.exe 内）缺 `window.dll` 就地补加载；
+  2. 远程线程调用宿主里的 `window.dll!StartWindow`，重启被杀/已退出的弹窗线程；
+  3. 最后才拉起 `xx.exe`（命名互斥锁串行化）。
+  `window.dll` 侧另有 1.5 秒"本桌面无任何 XX 弹窗就强建"的兜底（建窗前抢 `Local\xx_window_make_guard` 复查）。
+* 计数器方案取代了原来的手动重置事件方案：手动重置事件 `SetEvent` 之后永远不会超时，超时复活分支实际是死代码，而且等待会退化成 100% 忙等。
 
 ---
 
@@ -146,14 +166,16 @@
 ```text
 xx.exe
 │
-├──> svcguard.dll (守护与扩散)
+├──> svcguard.dll (守护与扩散，只在本会话扩散)
 │       ├──> window.dll (弹窗与日志)
-│       └──> 注入其他进程
-│             └──> window.dll (冗余弹窗)
+│       ├──> guard.dll  (注入 4 个宿主进程 + 交接 xx 进程句柄)
+│       └──> 注入其他本会话进程
+│             ├──> window.dll (冗余弹窗)
+│             └──> guard.dll  (宿主看门狗)
 │
 ├──> atkcore.dll (攻击工具箱)
 │       └──> payload.dll (攻击载荷)
 │
-├──> defense.dll (合并防御，StartDefense)
+└──> defense.dll (合并防御，StartDefense)
 │
 ```

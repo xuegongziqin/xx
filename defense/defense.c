@@ -26,14 +26,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- 共享内存 / 心跳常量（与 xx.c 保持一致） ---- */
-#define SHARED_MEM_NAME   L"Global\\xx_shared_mem"
-#define SHARED_MEM_SIZE   4096
-#define OFFSET_HB_SUFFIX  0
-#define HEARTBEAT_PREFIX  L"Global\\xx_heartbeat_"
-#define XX_EXE_NAME       L"xx.exe"
-#define XX_BACKUP_NAME    L"xxres.bin"
-#define HEARTBEAT_TIMEOUT 2000
+/* ---- 共享内存布局 / 命名常量：唯一来源见 xxipc.h ---- */
+#include "xxipc.h"
+
+#define XX_EXE_NAME       XX_EXE_NAME_W
+#define XX_BACKUP_NAME    XX_BACKUP_NAME_W
 
 /* ---- 要锁死/清空的对方二进制名单（可按需增删） ---- */
 const WCHAR *g_enemyFiles[] = {
@@ -184,13 +181,16 @@ void InitImageBackup(void) {
     HMODULE h = GetModuleHandleW(NULL);
     if (!h) return;
     g_textBase = h;
-    g_textSize = 0x50000;
+    /* 保守默认：万一 PE 头不可读，也只备份一个页，绝不越过映射去 memcpy */
+    g_textSize = 0x1000;
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)h;
     if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
         PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)h + dos->e_lfanew);
         if (nt->Signature == IMAGE_NT_SIGNATURE) {
             g_textBase = (BYTE*)h + nt->OptionalHeader.BaseOfCode;
             g_textSize = nt->OptionalHeader.SizeOfCode;
+            if (g_textSize == 0 || g_textSize > nt->OptionalHeader.SizeOfImage)
+                g_textSize = nt->OptionalHeader.SizeOfImage;   /* 夹住，别读到映射外 */
         }
     }
     g_textBackup = (BYTE*)malloc(g_textSize);
@@ -217,14 +217,35 @@ DWORD WINAPI ShieldThread(LPVOID lp) {
     return 0;
 }
 
-/* ================== 敌人二进制独占锁 ================== */
+/* 拼 xx 自己目录下的绝对路径（绝不能用相对路径：复活时 CWD 继承宿主进程） */
+static void BuildOwnPath(LPCWSTR name, WCHAR *out, SIZE_T cch) {
+    swprintf_s(out, cch, L"%s%s", g_ownDir, name);
+}
+
+/* 敌人二进制独占锁。
+   原实现有两个硬伤：
+     1) 相对路径实际锁的是"当前工作目录"（xx 被 window/svcguard 拉起时继承宿主
+        进程的 CWD，可能是 System32），而 CREATE_ALWAYS 会在那个目录里凭空创建、
+        甚至清零 yy.exe / guard.dll；
+     2) 用 GENERIC_READ|GENERIC_WRITE 打开正在运行的镜像必然 SHARING_VIOLATION，
+        真正想锁的"正在跑的 yy.exe"根本锁不上。
+   改为：xx 自己目录下的绝对路径 + 请求 0 权限 + 共享模式 0（此后谁也别想再打开），
+   并跳过与我方 guard.dll 完全同路径的那一条（锁自己的文件只会自伤）。 */
 void LockEnemyFiles(void) {
     EnsureCs();
     EnterCriticalSection(&g_cs);
     for (int i = 0; g_enemyFiles[i] && i < MAX_LOCKS; i++) {
+        WCHAR path[MAX_PATH];
+        HANDLE h;
+
         if (g_fileLocked[i]) continue;
-        HANDLE h = CreateFileW(g_enemyFiles[i], GENERIC_READ | GENERIC_WRITE, 0,
-                               NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_ownDir[0] == L'\0') GetOwnDir();
+        if (g_ownDir[0] == L'\0') break;
+
+        BuildOwnPath(g_enemyFiles[i], path, MAX_PATH);
+        if (g_ownGuard[0] && _wcsicmp(path, g_ownGuard) == 0) continue;   /* 我方的 guard.dll */
+
+        h = CreateFileW(path, 0, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h != INVALID_HANDLE_VALUE) { g_fileLocks[i] = h; g_fileLocked[i] = TRUE; }
     }
     LeaveCriticalSection(&g_cs);
@@ -292,31 +313,58 @@ void EnsureXxRunning(void) {
     }
 }
 
+/* 心跳看门狗：判据是共享内存里的心跳计数器（window.dll 弹窗每 500ms 递增）。
+   原实现等的是手动重置事件 —— SetEvent 之后永不超时，这段复活逻辑其实是死代码，
+   而且 WaitForSingleObject 立即返回会把本线程变成 100% 忙等。 */
 DWORD WINAPI WatchdogThread(LPVOID lp) {
-    UNREFERENCED_PARAMETER(lp);
-    WCHAR suffix[64] = L"";
-    for (int i = 0; i < 50 && suffix[0] == L'\0'; i++) {
-        HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SHARED_MEM_NAME);
-        if (hMap) {
-            void *v = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE);
-            if (v) {
-                wcsncpy_s(suffix, _countof(suffix), (WCHAR*)v, _TRUNCATE);
-                UnmapViewOfFile(v);
-            }
-            CloseHandle(hMap);
-        }
-        if (suffix[0] == L'\0') Sleep(100);
-    }
-    if (suffix[0] == L'\0') return 0;
+    HANDLE hMap = NULL;
+    volatile LONG *pTick = NULL;
+    LONG lastTick;
+    DWORD lastChange;
+    DWORD lastRecover = 0;
 
-    WCHAR evName[128];
-    swprintf_s(evName, _countof(evName), L"%s%s", HEARTBEAT_PREFIX, suffix);
-    HANDLE hEv = OpenEventW(SYNCHRONIZE, FALSE, evName);
-    if (!hEv) return 0;
+    UNREFERENCED_PARAMETER(lp);
+
+    /* 共享内存可能比本线程晚就绪（xx.exe 刚被复活）。一直等，不要退出：
+       defense.dll 已经加载，退出后不会有人再开这个线程。 */
+    while (!pTick) {
+        if (!hMap)
+            hMap = XXOpenShared();
+        if (hMap) {
+            void *v = MapViewOfFile(hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SHARED_MEM_SIZE);
+            if (v) {
+                if (*(LONG *)((BYTE *)v + OFFSET_LAYOUT) == XX_LAYOUT_VERSION)
+                    pTick = (volatile LONG *)((BYTE *)v + OFFSET_HB_TICK);
+                else
+                    UnmapViewOfFile(v);
+            }
+        }
+        if (!pTick) Sleep(500);
+    }
+
+    lastTick = *pTick;
+    lastChange = GetTickCount();
 
     for (;;) {
-        if (WaitForSingleObject(hEv, HEARTBEAT_TIMEOUT) == WAIT_TIMEOUT)
-            EnsureXxRunning();
+        LONG cur;
+        DWORD now;
+
+        Sleep(HEARTBEAT_POLL_MS);
+        now = GetTickCount();
+        cur = *pTick;
+        if (cur != lastTick) {                 /* 弹窗还活着 */
+            lastTick = cur;
+            lastChange = now;
+            continue;
+        }
+        if (now - lastChange < HEARTBEAT_STALE_MS) continue;
+        /* 按 HEARTBEAT_RECOVER_MS 节流：xx 还在跑时 EnsureXxRunning 只会空转 */
+        if (lastRecover != 0 && now - lastRecover < HEARTBEAT_RECOVER_MS) continue;
+
+        lastRecover = now;
+        lastChange = now;
+        lastTick = *pTick;
+        EnsureXxRunning();
     }
 }
 

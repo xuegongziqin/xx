@@ -9,8 +9,8 @@ echo ========================================
 set OUTDIR=bin
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
-set CFLAGS=-s -O2 -Wall -static -mwindows -finput-charset=UTF-8
-set DLLFLAGS=-s -O2 -Wall -static -shared -finput-charset=UTF-8
+set CFLAGS=-s -O2 -Wall -static -mwindows -I. -finput-charset=UTF-8
+set DLLFLAGS=-s -O2 -Wall -static -shared -I. -finput-charset=UTF-8
 
 echo.
 echo [1/8] Compiling xx.exe ...

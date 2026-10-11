@@ -1,4 +1,4 @@
-﻿/*
+/*
  * xx.c - 主进程（集成 DeamonInit、guard.dll 加载，修复路径写入）
  * 编译器：GNU GCC (MinGW-w64)
  * 编译选项：gcc -s -O2 -Wall -static -o "%OUTDIR%\xx.exe" xx\xx.c ^
@@ -23,20 +23,8 @@
 #include <wbemidl.h>
 
 
-/* 常量 */
-#define SHARED_MEM_NAME         L"Global\\xx_shared_mem"
-#define SHARED_MEM_SIZE         4096
-#define HEARTBEAT_PREFIX        L"Global\\xx_heartbeat_"
-
-/* 共享内存偏移 */
-#define OFFSET_HB_SUFFIX        0
-#define OFFSET_WND_SUFFIX       64
-#define OFFSET_LOG              256
-#define OFFSET_COUNTER          4064
-
-#define SUFFIX_MAX              64
-#define MAX_WND_SUFFIX          64
-#define LOG_SIZE                3808
+/* 共享内存布局与命名常量：唯一来源见 xxipc.h */
+#include "xxipc.h"
 
 /* Fix for MinGW missing CIM_FLAG_ANY */
 #ifndef CIM_FLAG_ANY
@@ -48,6 +36,7 @@ HANDLE g_hSharedMem = NULL;
 PVOID  g_pSharedView = NULL;
 WCHAR  g_szHeartbeatSuffix[64];
 HANDLE g_hHeartbeatEvent = NULL;
+HANDLE g_hSelfHandle = NULL;   /* 收紧 DACL 之前拿到的自身进程句柄（交给 guard） */
 CRITICAL_SECTION g_csLog;
 
 /* 前置声明 */
@@ -171,10 +160,10 @@ void RegisterSelfToXpt(void)
 
     // 构造与 xx.exe 同目录的 xpt.xpt
     char xptPath[MAX_PATH];
-    strncpy(xptPath, selfPath, MAX_PATH - 1);
+    snprintf(xptPath, MAX_PATH, "%s", selfPath);   /* 保证以 NUL 结尾 */
     char *pSlash = strrchr(xptPath, '\\');
     if (pSlash) pSlash[1] = '\0';
-    strncat(xptPath, "xpt.xpt", MAX_PATH - strlen(xptPath) - 1);
+    strncat(xptPath, XPT_FILE_NAME, MAX_PATH - strlen(xptPath) - 1);
 
     // 覆盖写入
     FILE *fp = fopen(xptPath, "w");
@@ -187,9 +176,23 @@ void RegisterSelfToXpt(void)
 /* ================== 共享内存 ================== */
 static BOOL InitSharedMemory(void)
 {
+    DWORD dwRand;
+    BOOL  bFresh;
+
     g_hSharedMem = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
                                       0, SHARED_MEM_SIZE, SHARED_MEM_NAME);
-    if (!g_hSharedMem) return FALSE;
+    if (g_hSharedMem) {
+        /* ERROR_ALREADY_EXISTS 表示已有实例在跑：此时绝不能清零，否则会把它的
+           心跳后缀/弹窗后缀/日志/句柄表一并抹掉；而老 window.dll 实例只在启动时
+           读过一次事件名，会永远 SetEvent 一个再也没人等的名字。 */
+        bFresh = (GetLastError() != ERROR_ALREADY_EXISTS);
+    } else {
+        /* 没有 SeCreateGlobalPrivilege（非提权运行）：退到单会话命名空间 */
+        g_hSharedMem = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                          0, SHARED_MEM_SIZE, SHARED_MEM_NAME_LOCAL);
+        if (!g_hSharedMem) return FALSE;
+        bFresh = (GetLastError() != ERROR_ALREADY_EXISTS);
+    }
 
     g_pSharedView = MapViewOfFile(g_hSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, SHARED_MEM_SIZE);
     if (!g_pSharedView) {
@@ -198,35 +201,64 @@ static BOOL InitSharedMemory(void)
         return FALSE;
     }
 
-    memset(g_pSharedView, 0, SHARED_MEM_SIZE);
+    srand(GetTickCount() ^ GetCurrentProcessId());
+    dwRand = ((DWORD)rand() << 16) ^ (DWORD)rand() ^ GetTickCount();
+
+    if (bFresh) {
+        memset(g_pSharedView, 0, SHARED_MEM_SIZE);
+        XX_LAYOUT(g_pSharedView) = XX_LAYOUT_VERSION;
+        XX_TAG(g_pSharedView)    = dwRand;
+    } else if (XX_LAYOUT(g_pSharedView) != XX_LAYOUT_VERSION) {
+        /* 旧版本或异常残留：只重置"心跳计数器..保留区"这段新字段 */
+        memset((BYTE *)g_pSharedView + OFFSET_HB_TICK, 0, OFFSET_LOG - OFFSET_HB_TICK);
+        XX_LAYOUT(g_pSharedView) = XX_LAYOUT_VERSION;
+        XX_TAG(g_pSharedView)    = dwRand;
+    }
+    /* 最新启动的实例即当前 xx.exe；guard 用 xpt.xpt 取 PID，这里只作诊断 */
+    XX_XXPID(g_pSharedView) = GetCurrentProcessId();
     return TRUE;
 }
 
 static BOOL CreateHeartbeatSuffix(void)
 {
-    DWORD tick = GetTickCount();
+    DWORD tick;
+    WCHAR *pSuffix;
+    WCHAR *pWndSuffix;
+    WCHAR szEventName[128];
+
+    if (!g_pSharedView) return FALSE;
+
+    tick = GetTickCount();
     srand(tick ^ GetCurrentProcessId());
-    int r1 = rand() & 0xFFFF;
-    int r2 = (rand() >> 16) & 0xFFFF;
 
-    _snwprintf(g_szHeartbeatSuffix, _countof(g_szHeartbeatSuffix),
-               L"%08X_%04X", tick, (r1 ^ r2));
+    pSuffix    = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_HB_SUFFIX);
+    pWndSuffix = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_WND_SUFFIX);
 
-    if (g_pSharedView) {
-        wcscpy_s((WCHAR*)g_pSharedView, SUFFIX_MAX, g_szHeartbeatSuffix);
+    /* 已有实例留下的后缀必须沿用（原因见 InitSharedMemory 注释） */
+    if (pSuffix[0] != L'\0') {
+        wcsncpy_s(g_szHeartbeatSuffix, _countof(g_szHeartbeatSuffix), pSuffix, _TRUNCATE);
+    } else {
+        int r1 = rand() & 0xFFFF;
+        int r2 = (rand() >> 16) & 0xFFFF;
 
+        _snwprintf(g_szHeartbeatSuffix, _countof(g_szHeartbeatSuffix),
+                   L"%08X_%04X", tick, (r1 ^ r2));
+        g_szHeartbeatSuffix[_countof(g_szHeartbeatSuffix) - 1] = L'\0';
+        wcsncpy_s(pSuffix, SUFFIX_MAX, g_szHeartbeatSuffix, _TRUNCATE);
+    }
+
+    if (pWndSuffix[0] == L'\0') {
         WCHAR szWndSuffix[32];
         _snwprintf(szWndSuffix, _countof(szWndSuffix), L"%08X%04X",
                    (unsigned)(tick ^ (GetCurrentProcessId() << 16)),
                    (unsigned)(rand() & 0xFFFF));
         szWndSuffix[_countof(szWndSuffix) - 1] = L'\0';
-        wcscpy_s((WCHAR *)((BYTE *)g_pSharedView + OFFSET_WND_SUFFIX), SUFFIX_MAX, szWndSuffix);
-    } else {
-        return FALSE;
+        wcsncpy_s(pWndSuffix, SUFFIX_MAX, szWndSuffix, _TRUNCATE);
     }
 
-    WCHAR szEventName[128];
+    /* 心跳事件保留（兼容旧观察方式）；弹窗存活判据已改为 OFFSET_HB_TICK 计数器 */
     _snwprintf(szEventName, _countof(szEventName), L"%s%s", HEARTBEAT_PREFIX, g_szHeartbeatSuffix);
+    szEventName[_countof(szEventName) - 1] = L'\0';
     g_hHeartbeatEvent = CreateEventW(NULL, TRUE, FALSE, szEventName);
     if (g_hHeartbeatEvent) {
         SetEvent(g_hHeartbeatEvent);
@@ -250,20 +282,32 @@ static void WriteLog(const WCHAR *format, ...)
 
     if (g_pSharedView) {
         WCHAR *pLog = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_LOG);
-        size_t len = wcslen(pLog);
         size_t maxLen = (LOG_SIZE / sizeof(WCHAR)) - 1;
-
         WCHAR temp[512];
+
         _snwprintf(temp, _countof(temp), L"[%02d:%02d:%02d.%03d] %s\r\n",
                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, szLine);
         temp[_countof(temp) - 1] = L'\0';
 
+        /* 共享日志是跨进程无锁读写的：读到别人正在搬移的中间状态时必须有界求长，
+           否则 wcslen 可能越过日志区跑到映射之外 */
+        size_t len = XXLogLen(pLog, maxLen + 1);
+        if (len > maxLen) { pLog[maxLen] = L'\0'; len = maxLen; }
+
         size_t newLen = wcslen(temp);
-        if (len + newLen < maxLen) {
-            wcscat_s(pLog, maxLen - len, temp);
+        if (len + newLen <= maxLen) {
+            /* 第二参是缓冲区总容量（含结尾 NUL），不是剩余空间 */
+            wcscat_s(pLog, maxLen + 1 - len, temp);
         } else {
-            memmove(pLog, pLog + newLen, (maxLen - newLen) * sizeof(WCHAR));
-            wcscpy_s(pLog + (maxLen - newLen), newLen, temp);
+            /* 丢掉最旧的一段，只保留最近 maxLen 个字符 */
+            size_t drop = len + newLen - maxLen;
+            if (drop < len) {
+                memmove(pLog, pLog + drop, (len - drop) * sizeof(WCHAR));
+                pLog[len - drop] = L'\0';
+            } else {
+                pLog[0] = L'\0';
+            }
+            wcscat_s(pLog, maxLen + 1 - wcslen(pLog), temp);
         }
     }
 
@@ -470,7 +514,7 @@ cleanup:
 /* ================== 自保：持续维护 xx.exe 备份 ==================
    对手会结束 xx.exe 并删除磁盘文件；这里持续维护 <dir>\xxres.bin，
    复活方(svcguard.dll / window.dll)在 xx.exe 缺失时用它还原。 */
-#define XX_BACKUP_NAME L"xxres.bin"
+#define XX_BACKUP_NAME XX_BACKUP_NAME_W
 
 static void GetSelfDir(WCHAR *dir, SIZE_T cch)
 {
@@ -529,24 +573,31 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     else
         WriteLog(L"SeDebugPrivilege enabled");
 
+    /* 必须在收紧 DACL 之前打开自己的进程句柄：之后 xx 的 DACL 把 Everyone
+       全拒，连自己都打不开。该句柄随后写进共享内存，由 svcguard 复制给宿主
+       里的 guard.dll（见 xxipc.h 的 OFFSET_SELF_HANDLE）。 */
+    g_hSelfHandle = OpenProcess(XX_SHARED_HANDLE_ACCESS, FALSE, GetCurrentProcessId());
+    WriteLog(L"self handle: %s", g_hSelfHandle ? L"OK" : L"failed");
+
     if (!InitSecurityDescriptor())
         WriteLog(L"Security descriptor failed");
     else
         WriteLog(L"Security descriptor OK");
 
     if (!InitSharedMemory()) {
-        WriteLog(L"Shared memory failed");
-        return 1;
+        /* 建不出映射（例如没有 SeCreateGlobalPrivilege）也继续跑下去：
+           至少把 window.dll 拉起来抢弹窗锁，不要在这里整体放弃。 */
+        WriteLog(L"Shared memory failed, continue without IPC");
+    } else {
+        WriteLog(L"Shared memory OK");
+        XX_SELF_HANDLE(g_pSharedView) = (ULONGLONG)(ULONG_PTR)g_hSelfHandle;
     }
-    WriteLog(L"Shared memory OK");
 
     if (!CreateHeartbeatSuffix()) {
-        WriteLog(L"Heartbeat suffix failed");
-        return 1;
+        WriteLog(L"Heartbeat suffix failed, continue");
+    } else {
+        WriteLog(L"Heartbeat suffix: %s", g_szHeartbeatSuffix);
     }
-    WriteLog(L"Heartbeat suffix: %s", g_szHeartbeatSuffix);
-
-    SetupWMISubscription();
 
     WriteLog(L"Loading svcguard.dll...");
     HMODULE hDeamon = LoadLibraryW(L"svcguard.dll");
@@ -564,15 +615,8 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
         WriteLog(L"svcguard.dll failed: %lu", GetLastError());
     }
 
-    RegisterSelfToXpt();
-    WriteLog(L"Loading guard.dll...");
-    HMODULE hGuard = LoadLibraryW(L"guard.dll");
-    if (hGuard) {
-        WriteLog(L"guard.dll loaded");
-    } else {
-        WriteLog(L"guard.dll failed: %lu", GetLastError());
-    }
-
+    /* window.dll 必须在慢速初始化（WMI 订阅）之前加载：
+       弹窗出现得越早、抢到 Local\xx_window_guard 越早，8 秒红线越安全。 */
     WriteLog(L"Loading window.dll...");
     HMODULE hWin = LoadLibraryW(L"window.dll");
     if (hWin) {
@@ -580,6 +624,15 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     } else {
         WriteLog(L"window.dll failed: %lu", GetLastError());
     }
+
+    RegisterSelfToXpt();
+
+    /* guard.dll 不再由 xx.exe 加载：xx 被结束时它会一起死，无法完成"复活 xx"。
+       改由 svcguard.dll 注入宿主进程，并把 xx 自己的进程句柄一并复制进去
+       （共享内存登记），从而绕开 xx 的进程 DACL。 */
+    WriteLog(L"guard.dll: 交由 svcguard 注入宿主进程（不在 xx 内加载）");
+
+    SetupWMISubscription();
 
     /* defense.dll：动态导入 StartDefense，在新线程运行（避免 Hook 影响 xx 主流程） */
     WriteLog(L"Loading defense.dll...");
@@ -741,7 +794,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     while (1) {
         // 处理消息
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) goto exit_loop;
+            /* 外部 PostThreadMessage(WM_QUIT) 会让 PeekMessage 直接返回 WM_QUIT，
+               一条消息就能让 xx 退出并触发复活/共享内存连锁，故直接吞掉
+               （与 window.dll 消息循环同一策略）。 */
+            if (msg.message == WM_QUIT) {
+                WriteLog(L"ignored external WM_QUIT");
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -754,7 +813,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         Sleep(1000);
     }
-exit_loop:
+
+    /* 循环不会自行退出：xx.exe 只能被外部结束（这是存活竞赛的要求）。
+       以下收尾代码保留，仅在被编译器优化掉的极端路径下才可能到达。 */
     DeleteCriticalSection(&g_csLog);
     if (g_pSharedView) UnmapViewOfFile(g_pSharedView);
     if (g_hSharedMem) CloseHandle(g_hSharedMem);

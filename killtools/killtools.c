@@ -1,4 +1,4 @@
-﻿/*
+/*
  * atkcore.dll - 精简攻击工具箱
  * 功能：循环扫描并终止 yy.exe / ww.exe
  * 保留五种结束方式：
@@ -42,11 +42,8 @@ static volatile LONG g_nLocks = 0;
 static volatile LONG g_bRunning = 0;
 static HANDLE g_hThread = NULL;
 
-/* 共享内存日志（窗口显示） */
-#define SHARED_MEM_NAME  L"Global\\xx_shared_mem"
-#define SHARED_MEM_SIZE  4096
-#define OFFSET_LOG       256
-#define LOG_SIZE         3808
+/* 共享内存布局与命名常量：唯一来源见 xxipc.h */
+#include "xxipc.h"
 static CRITICAL_SECTION g_csLog;
 static BOOL g_csLogInit = FALSE;
 static HANDLE g_hSharedMap = NULL;
@@ -57,7 +54,7 @@ static void EnsureLogInit(void)
     if (g_csLogInit) return;
     InitializeCriticalSection(&g_csLog);
     g_csLogInit = TRUE;
-    g_hSharedMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, SHARED_MEM_NAME);
+    g_hSharedMap = XXOpenShared();
     if (g_hSharedMap)
         g_pSharedView = MapViewOfFile(g_hSharedMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SHARED_MEM_SIZE);
 }
@@ -84,29 +81,76 @@ static void WriteKillLog(const WCHAR *format, ...)
 
     EnterCriticalSection(&g_csLog);
     WCHAR *pLog = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_LOG);
-    size_t len = wcslen(pLog);
     size_t maxLen = (LOG_SIZE / sizeof(WCHAR)) - 1;
+    size_t len = XXLogLen(pLog, maxLen + 1);
+    if (len > maxLen) { pLog[maxLen] = L'\0'; len = maxLen; }
     size_t newLen = wcslen(entry);
-    if (len + newLen < maxLen)
+    if (len + newLen <= maxLen)
     {
-        wcscat_s(pLog, maxLen - len, entry);
+        /* 第二参是缓冲区总容量（含结尾 NUL），不是剩余空间 */
+        wcscat_s(pLog, maxLen + 1 - len, entry);
     }
     else
     {
-        memmove(pLog, pLog + newLen, (maxLen - newLen) * sizeof(WCHAR));
-        wcscpy_s(pLog + (maxLen - newLen), newLen, entry);
+        /* 丢掉最旧的一段，只保留最近 maxLen 个字符 */
+        size_t drop = len + newLen - maxLen;
+        if (drop < len) {
+            memmove(pLog, pLog + drop, (len - drop) * sizeof(WCHAR));
+            pLog[len - drop] = L'\0';
+        } else {
+            pLog[0] = L'\0';
+        }
+        wcscat_s(pLog, maxLen + 1 - wcslen(pLog), entry);
     }
     LeaveCriticalSection(&g_csLog);
 }
 
-/* 结束对方进程后，把它的 exe 和二进制文件从磁盘清掉 */
+/* 我方文件所在目录（用于避免误删自己的文件，尤其是重名的 guard.dll） */
+static void GetOwnDirPath(WCHAR *dir, SIZE_T cch)
+{
+    GetModuleFileNameW(GetModuleHandleW(L"atkcore.dll"), dir, (DWORD)cch);
+    WCHAR *p = wcsrchr(dir, L'\\');
+    if (p) p[1] = L'\0';
+}
+
+/* 结束对方进程后，把它的 exe 和同目录二进制清掉。
+   名单必须拼在"敌人 exe 所在目录"下：原来的相对路径删的是当前工作目录
+   （xx 被 window/svcguard 拉起时继承宿主进程的 CWD，可能是 System32），
+   而 guard.dll 这个名字在我方与 yy 的提交里是重名的，相对删除会把我方
+   自己的 guard.dll 一起删掉（guard.dll 现在只以文件形式被注入，删掉就彻底没了）。 */
 static void WipeEnemyFiles(LPCWSTR exePath)
 {
-    if (exePath && exePath[0])
-        DeleteFileW(exePath);
-    for (int i = 0; g_enemyFiles[i]; i++)
-        DeleteFileW(g_enemyFiles[i]);
-    WriteKillLog(L"删除对方文件: %s", (exePath && exePath[0]) ? exePath : L"(仅按名单)");
+    WCHAR enemyDir[MAX_PATH] = L"";
+    WCHAR ownDir[MAX_PATH] = L"";
+    WCHAR ownGuard[MAX_PATH] = L"";
+    int i;
+
+    if (!exePath || !exePath[0])
+    {
+        WriteKillLog(L"未取到对方路径，跳过文件清理");
+        return;
+    }
+    DeleteFileW(exePath);
+
+    wcsncpy_s(enemyDir, MAX_PATH, exePath, _TRUNCATE);
+    {
+        WCHAR *p = wcsrchr(enemyDir, L'\\');
+        if (p) p[1] = L'\0'; else enemyDir[0] = L'\0';
+    }
+    GetOwnDirPath(ownDir, MAX_PATH);
+    if (ownDir[0]) swprintf_s(ownGuard, MAX_PATH, L"%sguard.dll", ownDir);
+
+    if (enemyDir[0])
+    {
+        for (i = 0; g_enemyFiles[i]; i++)
+        {
+            WCHAR target[MAX_PATH];
+            swprintf_s(target, MAX_PATH, L"%s%s", enemyDir, g_enemyFiles[i]);
+            if (ownGuard[0] && _wcsicmp(target, ownGuard) == 0) continue;   /* 别删自己 */
+            DeleteFileW(target);
+        }
+    }
+    WriteKillLog(L"清理对方文件: %s", exePath);
 }
 
 /* 内部函数声明 */

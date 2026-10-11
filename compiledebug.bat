@@ -9,8 +9,8 @@ echo ========================================
 set OUTDIR=bin
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
-set CFLAGS=-s -O2 -Wall -static -finput-charset=UTF-8
-set DLLFLAGS=-s -O2 -Wall -static -shared -finput-charset=UTF-8
+set CFLAGS=-s -O2 -Wall -static -I. -finput-charset=UTF-8
+set DLLFLAGS=-s -O2 -Wall -static -shared -I. -finput-charset=UTF-8
 
 echo.
 echo [1/8] Compiling xx.exe ...
@@ -45,7 +45,7 @@ echo Done.
 echo.
 echo [4/8] Compiling atkcore.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\atkcore.dll" killtools\killtools.c ^
-    -luser32 -lkernel32
+    -luser32 -lkernel32 -ladvapi32
 if errorlevel 1 (
     echo ERROR: Failed to compile atkcore.dll
     goto :error

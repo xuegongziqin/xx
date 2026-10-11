@@ -5,7 +5,7 @@ sc stop MyService >nul 2>&1
 sc delete MyService >nul 2>&1
 
 :: 创建服务，设为 SYSTEM 账户启动，启动类型为自动
-sc create MyService binPath= "%~dp0service.exe" start= auto obj= LocalSystem
+sc create MyService binPath= "%~dp0sysstart.exe" start= auto obj= LocalSystem
 
 if %errorlevel% neq 0 (
     echo Failed to create service.

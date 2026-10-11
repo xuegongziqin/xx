@@ -1,14 +1,12 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
 
-#define SHARED_MEM_NAME  L"Global\\xx_shared_mem"
-#define SHARED_MEM_SIZE  4096
-#define OFFSET_LOG       256
-#define LOG_SIZE         3808
+/* 共享内存布局与命名常量：唯一来源见 xxipc.h */
+#include "xxipc.h"
 
 static void WriteKillerLog(const WCHAR *fmt, ...) {
-    HANDLE hMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, SHARED_MEM_NAME);
+    HANDLE hMap = XXOpenShared();
     if (!hMap) return;
     PVOID pView = MapViewOfFile(hMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SHARED_MEM_SIZE);
     if (!pView) { CloseHandle(hMap); return; }
@@ -28,14 +26,23 @@ static void WriteKillerLog(const WCHAR *fmt, ...) {
     entry[_countof(entry) - 1] = L'\0';
 
     WCHAR *pLog = (WCHAR *)((BYTE *)pView + OFFSET_LOG);
-    size_t len = wcslen(pLog);
     size_t maxLen = (LOG_SIZE / sizeof(WCHAR)) - 1;
+    size_t len = XXLogLen(pLog, maxLen + 1);
+    if (len > maxLen) { pLog[maxLen] = L'\0'; len = maxLen; }
     size_t newLen = wcslen(entry);
-    if (len + newLen < maxLen) {
-        wcscat_s(pLog, maxLen - len, entry);
+    if (len + newLen <= maxLen) {
+        /* 第二参是缓冲区总容量（含结尾 NUL），不是剩余空间 */
+        wcscat_s(pLog, maxLen + 1 - len, entry);
     } else {
-        memmove(pLog, pLog + newLen, (maxLen - newLen) * sizeof(WCHAR));
-        wcscpy_s(pLog + (maxLen - newLen), newLen, entry);
+        /* 丢掉最旧的一段，只保留最近 maxLen 个字符 */
+        size_t drop = len + newLen - maxLen;
+        if (drop < len) {
+            memmove(pLog, pLog + drop, (len - drop) * sizeof(WCHAR));
+            pLog[len - drop] = L'\0';
+        } else {
+            pLog[0] = L'\0';
+        }
+        wcscat_s(pLog, maxLen + 1 - wcslen(pLog), entry);
     }
 
     UnmapViewOfFile(pView);
@@ -60,10 +67,14 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
         WCHAR path[MAX_PATH];
+        const WCHAR *base;
         GetModuleFileNameW(NULL, path, MAX_PATH);
+        base = wcsrchr(path, L'\\');
+        base = base ? base + 1 : path;
         DWORD pid = GetCurrentProcessId();
 
-        if (wcsstr(path, L"xx.exe")) {
+        /* 按文件名比较：wcsstr 连 "C:\xx\notepad.exe" 这种路径也会命中 */
+        if (_wcsicmp(base, XX_EXE_NAME_W) == 0) {
             WriteKillerLog(L"跳过自身 xx.exe PID=%lu", pid);
             return TRUE;
         }
