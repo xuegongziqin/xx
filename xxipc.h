@@ -66,6 +66,7 @@
 #define OFFSET_TAG              268
 #define OFFSET_HDL_TABLE        272
 #define OFFSET_SELF_HANDLE      656     /* xx.exe 启动早期（DACL 收紧前）打开的自身进程句柄 */
+#define OFFSET_XX_SESSION       664     /* xx.exe 所在登录会话，复活时据此避免影子实例 */
 #define OFFSET_COUNTER          4048
 
 #define SUFFIX_MAX              64
@@ -100,7 +101,39 @@
 #define XX_XXPID(p)             (*(DWORD   *)((BYTE *)(p) + OFFSET_XX_PID))
 #define XX_TAG(p)               (*(DWORD   *)((BYTE *)(p) + OFFSET_TAG))
 #define XX_SELF_HANDLE(p)       (*(ULONGLONG *)((BYTE *)(p) + OFFSET_SELF_HANDLE))
+#define XX_SESSION(p)           (*(LONG    *)((BYTE *)(p) + OFFSET_XX_SESSION))
 #define XX_COUNTER(p)           (*(volatile LONG *)((BYTE *)(p) + OFFSET_COUNTER))
+
+/* ---- 排查用文件日志 ----
+   共享内存日志只有在弹窗出现后才看得见；一旦"没有弹窗"，现场就完全失明。
+   所以关键日志同时追加一份到 %TEMP%\xx_debug.log（各进程共写，有总大小上限）。
+   每个模块各自限流，不会无限增长。 */
+#define XX_DEBUG_LOG_NAME       L"xx_debug.log"
+#define XX_DEBUG_LOG_MAX        262144
+
+static __inline void XXFileLog(const WCHAR *line) {
+    static LONG s_written = 0;
+    WCHAR path[MAX_PATH];
+    HANDLE h;
+    DWORD len = 0, wrote = 0;
+
+    if (s_written >= XX_DEBUG_LOG_MAX) return;
+    if (!GetTempPathW(MAX_PATH, path)) return;
+    if (wcslen(path) + wcslen(XX_DEBUG_LOG_NAME) + 1 >= MAX_PATH) return;
+    wcscat_s(path, MAX_PATH, XX_DEBUG_LOG_NAME);
+
+    h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (GetLastError() != ERROR_ALREADY_EXISTS) {   /* 新文件：先写 BOM，记事本能认 */
+        const WCHAR bom = 0xFEFF;
+        WriteFile(h, &bom, sizeof(bom), &wrote, NULL);
+    }
+    len = (DWORD)(wcslen(line) * sizeof(WCHAR));
+    if (WriteFile(h, line, len, &wrote, NULL))
+        InterlockedExchangeAdd(&s_written, (LONG)wrote);
+    CloseHandle(h);
+}
 
 /* ---- 跨进程共享内存的创建 / 打开（Global\ 拿不到就退 Local\） ---- */
 static __inline HANDLE XXOpenShared(void) {
@@ -130,7 +163,8 @@ _Static_assert(OFFSET_XX_PID + 4 <= OFFSET_TAG, "xx pid overlaps tag");
 _Static_assert(OFFSET_TAG + 4 <= OFFSET_HDL_TABLE, "tag overlaps handle table");
 _Static_assert(OFFSET_HDL_TABLE + HDL_TABLE_MAX * HDL_ENTRY_SIZE <= OFFSET_SELF_HANDLE,
                "handle table overlaps self-handle slot");
-_Static_assert(OFFSET_SELF_HANDLE + 8 <= OFFSET_LOG, "self-handle overlaps log");
+_Static_assert(OFFSET_XX_SESSION + 4 <= OFFSET_LOG, "xx session overlaps log");
+_Static_assert(OFFSET_SELF_HANDLE % 8 == 0, "self-handle must stay 8-byte aligned");
 _Static_assert(OFFSET_LOG + LOG_SIZE <= OFFSET_COUNTER, "log overlaps counter");
 _Static_assert(OFFSET_COUNTER + 4 <= SHARED_MEM_SIZE, "counter outside shared memory");
 _Static_assert(OFFSET_HDL_TABLE % 8 == 0 && HDL_ENTRY_SIZE % 8 == 0 && OFFSET_SELF_HANDLE % 8 == 0,

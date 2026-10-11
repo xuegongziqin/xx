@@ -229,8 +229,11 @@ static void BuildOwnPath(LPCWSTR name, WCHAR *out, SIZE_T cch) {
         甚至清零 yy.exe / guard.dll；
      2) 用 GENERIC_READ|GENERIC_WRITE 打开正在运行的镜像必然 SHARING_VIOLATION，
         真正想锁的"正在跑的 yy.exe"根本锁不上。
-   改为：xx 自己目录下的绝对路径 + 请求 0 权限 + 共享模式 0（此后谁也别想再打开），
-   并跳过与我方 guard.dll 完全同路径的那一条（锁自己的文件只会自伤）。 */
+   改为：xx 自己目录下的绝对路径 + 请求 0 权限 + 共享模式 FILE_SHARE_READ，
+   并跳过与我方 guard.dll 完全同路径的那一条（锁自己的文件只会自伤）。
+   共享模式必须是 FILE_SHARE_READ 而不是 0：实测（Windows）用 share=0 打开
+   正在运行的镜像会直接 SHARING_VIOLATION（加载器自己持着读句柄），
+   留出 READ 之后既能成功持锁，又能挡住删除 / 改名 / 覆盖写入。 */
 void LockEnemyFiles(void) {
     EnsureCs();
     EnterCriticalSection(&g_cs);
@@ -245,7 +248,7 @@ void LockEnemyFiles(void) {
         BuildOwnPath(g_enemyFiles[i], path, MAX_PATH);
         if (g_ownGuard[0] && _wcsicmp(path, g_ownGuard) == 0) continue;   /* 我方的 guard.dll */
 
-        h = CreateFileW(path, 0, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        h = CreateFileW(path, 0, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h != INVALID_HANDLE_VALUE) { g_fileLocks[i] = h; g_fileLocked[i] = TRUE; }
     }
     LeaveCriticalSection(&g_cs);

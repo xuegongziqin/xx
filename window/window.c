@@ -8,9 +8,12 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* 共享内存布局与命名常量：唯一来源见 xxipc.h */
 #include "xxipc.h"
+
+/* 日志实现见下方（需要 g_pSharedView，故放在全局变量之后） */
 
 /* 弹窗尺寸：450x325 = 原来的 900x650 的 1/4 面积 */
 #define WND_WIDTH           450
@@ -37,6 +40,63 @@ static DWORD  g_dwLastDesktopCheck = 0; /* 桌面窗口枚举节流 */
 static volatile LONG g_bFoundOwnWindow = 0;
 static volatile LONG g_bDestroying = 0;  /* 我们自己正在 DestroyWindow */
 static DWORD  g_dwLogSig = 0;            /* 上一次画过的日志指纹 */
+static CRITICAL_SECTION g_csWinLog;
+static BOOL g_csWinLogInit = FALSE;
+static BOOL g_bLoggedStandby = FALSE;   /* 热备日志只报一次状态变化 */
+
+/* ================== 日志（共享内存 + %TEMP%\xx_debug.log） ==================
+   弹窗自己以前完全不打日志：一旦"没有弹窗"，就完全看不出它卡在哪一步。
+   现在把关键决策（互斥体结果 / 建窗成功失败 / 兜底 / 重建）都记下来，
+   并且同时落一份到 %TEMP%\xx_debug.log，没有弹窗时也能查。 */
+static void WriteWinLog(const WCHAR *fmt, ...) {
+    WCHAR line[512], fline[640];
+    va_list args;
+
+    if (!g_csWinLogInit) {
+        InitializeCriticalSection(&g_csWinLog);
+        g_csWinLogInit = TRUE;
+    }
+    va_start(args, fmt);
+    _vsnwprintf(line, _countof(line) - 1, fmt, args);
+    va_end(args);
+    line[_countof(line) - 1] = L'\0';
+
+    _snwprintf(fline, _countof(fline), L"[window][pid=%lu] %s\r\n", GetCurrentProcessId(), line);
+    fline[_countof(fline) - 1] = L'\0';
+    XXFileLog(fline);
+
+    if (!g_pSharedView) return;
+    EnterCriticalSection(&g_csWinLog);
+    {
+        SYSTEMTIME st;
+        WCHAR *pLog = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_LOG);
+        size_t maxLen = (LOG_SIZE / sizeof(WCHAR)) - 1;
+        WCHAR entry[600];
+        size_t len, newLen, drop;
+
+        GetLocalTime(&st);
+        _snwprintf(entry, _countof(entry) - 1, L"[%02d:%02d:%02d.%03d] [window] %s\r\n",
+                   st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+        entry[_countof(entry) - 1] = L'\0';
+
+        len = XXLogLen(pLog, maxLen + 1);
+        if (len > maxLen) { pLog[maxLen] = L'\0'; len = maxLen; }
+        newLen = wcslen(entry);
+        if (len + newLen <= maxLen) {
+            wcscat_s(pLog, maxLen + 1 - len, entry);
+        } else {
+            drop = len + newLen - maxLen;
+            if (drop < len) {
+                memmove(pLog, pLog + drop, (len - drop) * sizeof(WCHAR));
+                pLog[len - drop] = L'\0';
+            } else {
+                pLog[0] = L'\0';
+            }
+            wcscat_s(pLog, maxLen + 1 - wcslen(pLog), entry);
+        }
+    }
+    LeaveCriticalSection(&g_csWinLog);
+}
 
 /* 内部函数 */
 static BOOL OpenSharedMemory(void);
@@ -47,7 +107,7 @@ static BOOL AnyOwnWindowOnDesktop(void);
 static void ReadLog(WCHAR *buffer, SIZE_T size);
 static DWORD WINAPI WindowMainThread(LPVOID lpParam);
 __declspec(dllexport) DWORD WINAPI StartWindow(LPVOID lp);   /* 供 svcguard 远程拉起 */
-static void ServeWindow(const WCHAR *szClassName, HINSTANCE hInst);
+static BOOL ServeWindow(const WCHAR *szClassName, HINSTANCE hInst);
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static void GetXxExePath(WCHAR *path, SIZE_T size);
 static BOOL IsXxRunning(void);
@@ -447,19 +507,30 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     return PassThroughMsg(msg) ? DefWindowProc(hWnd, msg, wParam, lParam) : 0;
 }
 
-/* 建窗 + 跑消息循环 + 收尾。持有互斥锁与否都能调用（兜底路径不持锁）。 */
-static void ServeWindow(const WCHAR *szClassName, HINSTANCE hInst)
+/* 建窗 + 跑消息循环 + 收尾。持有互斥锁与否都能调用（兜底路径不持锁）。
+   返回是否真的把弹窗建起来过 —— 建不起来时调用方要退避，
+   否则会变成"抢锁→建窗失败→放锁→再抢"的 100% 忙等。 */
+static BOOL ServeWindow(const WCHAR *szClassName, HINSTANCE hInst)
 {
     MSG msg;
+    BOOL bServed = FALSE;
 
-    g_hWnd = CreateWindowExW(0, szClassName, L"XX Alive",
+    /* WS_EX_TOPMOST：弹窗就是存活证明，绝不能被别的窗口盖住、也不该在任务栏里
+       和宿主进程（explorer 等）混在一起看不出来。 */
+    g_hWnd = CreateWindowExW(WS_EX_TOPMOST, szClassName, L"XX PROGRAM - ALIVE",
                              WS_OVERLAPPEDWINDOW & ~WS_SYSMENU,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              WND_WIDTH, WND_HEIGHT, NULL, NULL, hInst, NULL);
-    if (!g_hWnd) return;
+    if (!g_hWnd) {
+        WriteWinLog(L"CreateWindowExW FAILED err=%lu", GetLastError());
+        return FALSE;
+    }
+    bServed = TRUE;
 
     ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
+    WriteWinLog(L"window created hwnd=%p visible=%d topmost=1",
+                (void *)g_hWnd, (int)IsWindowVisible(g_hWnd));
 
     /* 消息循环：拒绝外部投递的 WM_QUIT
        （对手 PostMessage(WM_QUIT) 会让 GetMessage 返回 0，
@@ -487,6 +558,8 @@ static void ServeWindow(const WCHAR *szClassName, HINSTANCE hInst)
     }
     g_hWnd = NULL;
     g_bWindowAlive = 0;
+    WriteWinLog(L"window loop ended (exit=%ld) -> 回到热备", (long)g_bExitThread);
+    return bServed;
 }
 
 static DWORD WINAPI WindowMainThread(LPVOID lpParam)
@@ -498,34 +571,49 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
 
     /* 共享内存与后缀可能比本实例晚就绪（xx.exe 刚被复活、正在重建字段），
        这里一直等下去：模块已经注入到宿主里，退出就再也不会被重新注入。 */
+    WriteWinLog(L"window thread start");
     for (;;) {
+        DWORD waited = 0;
         if (g_bExitThread) return 0;
         if (!g_pSharedView) OpenSharedMemory();
         if (g_pSharedView) {
             pWndSuffix = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_WND_SUFFIX);
             if (pWndSuffix[0] != L'\0') break;
         }
+        /* 3 秒还拿不到后缀（映射建不出来、被清零等）就用本地类名继续建窗：
+           弹窗本身就是胜负判据，绝不能因为一个字段没就绪就永远不弹。 */
+        if (waited >= 3000) { pWndSuffix = NULL; break; }
         Sleep(200);
+        waited += 200;
     }
 
     /* 事件对象仅为兼容旧观察方式，失败不影响弹窗 */
     InitHeartbeatEvent();
     BumpHeartbeatTick();
 
-    _snwprintf(szClassName, _countof(szClassName), L"XX_ALIVE_WND_%s", pWndSuffix);
+    if (pWndSuffix) {
+        _snwprintf(szClassName, _countof(szClassName), L"XX_ALIVE_WND_%s", pWndSuffix);
+    } else {
+        _snwprintf(szClassName, _countof(szClassName), L"XX_ALIVE_WND_LOCAL%08X%04X",
+                   (unsigned)GetTickCount(), (unsigned)GetCurrentProcessId());
+        WriteWinLog(L"共享内存/窗口后缀未就绪，改用本地类名 %ls", szClassName);
+    }
     szClassName[_countof(szClassName) - 1] = L'\0';
+    WriteWinLog(L"class=%ls sharedmem=%ls", szClassName, g_pSharedView ? L"OK" : L"MISSING");
 
     WNDCLASSW wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleW(L"window.dll");
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = szClassName;
-    RegisterClassW(&wc);
+    if (!RegisterClassW(&wc))
+        WriteWinLog(L"RegisterClassW failed err=%lu", GetLastError());
 
     /* Local\ 命名空间按登录会话隔离：不需要 SeCreateGlobalPrivilege，
        session 0 里的实例也抢不到交互会话的锁（反之亦然）。 */
     g_hGuardMutex = CreateMutexW(NULL, FALSE, WINDOW_GUARD_MUTEX);
     g_hMakeGuard  = CreateMutexW(NULL, FALSE, WINDOW_MAKE_GUARD_MUTEX);
+    if (!g_hGuardMutex) WriteWinLog(L"CreateMutex(%ls) failed err=%lu", WINDOW_GUARD_MUTEX, GetLastError());
 
     // 极速热备循环：几乎无延迟接管
     while (!g_bExitThread) {
@@ -540,9 +628,12 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
 
         if (dwWait == WAIT_OBJECT_0 || dwWait == WAIT_ABANDONED) {
             /* 获得弹窗权（ABANDONED = 前任持有者已死，锁归我们）：确保 xx.exe 存活 */
+            WriteWinLog(L"mutex %ls -> 建窗", dwWait == WAIT_ABANDONED ? L"abandoned" : L"acquired");
             EnsureXxRunning();
-            ServeWindow(szClassName, wc.hInstance);
+            if (!ServeWindow(szClassName, wc.hInstance))
+                Sleep(200);                       /* 建不起来就退避，别忙等 */
             g_dwNoWindowSince = 0;
+            g_bLoggedStandby = FALSE;
             if (g_hGuardMutex) ReleaseMutex(g_hGuardMutex);
             continue;
         }
@@ -557,6 +648,10 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
             if (g_dwLastDesktopCheck == 0 || now - g_dwLastDesktopCheck >= DESKTOP_CHECK_MS) {
                 g_dwLastDesktopCheck = now;
                 if (AnyOwnWindowOnDesktop()) {
+                    if (!g_bLoggedStandby) {
+                        g_bLoggedStandby = TRUE;
+                        WriteWinLog(L"mutex busy，本桌面已有弹窗 -> 热备");
+                    }
                     g_dwNoWindowSince = 0;
                     /* 本实例没持有窗口（g_bWindowAlive=0），所以直接递增计数器：
                        只要弹窗还在屏幕上，即使持有者被挂起/冻结也不能误判丢失 */
@@ -571,10 +666,13 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
                     BOOL bOwnMake = (wMake == WAIT_OBJECT_0 || wMake == WAIT_ABANDONED);
                     if (bOwnMake || !g_hMakeGuard) {
                         if (!AnyOwnWindowOnDesktop()) {
+                            WriteWinLog(L"mutex busy 且 %dms 无弹窗 -> 兜底建窗", WINDOW_FALLBACK_MS);
                             EnsureXxRunning();
                             ServeWindow(szClassName, wc.hInstance);
                         }
                         if (bOwnMake) ReleaseMutex(g_hMakeGuard);
+                    } else {
+                        WriteWinLog(L"兜底建窗抢不到 make-guard（别的实例在建）");
                     }
                     g_dwNoWindowSince = 0;
                     continue;

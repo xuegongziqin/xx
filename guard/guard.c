@@ -123,11 +123,20 @@ static void WriteGuardLog(const WCHAR *fmt, ...) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     WCHAR szLine[512];
+    WCHAR fline[640];
     va_list args;
     va_start(args, fmt);
     _vsnwprintf(szLine, _countof(szLine) - 1, fmt, args);
     va_end(args);
     szLine[_countof(szLine) - 1] = L'\0';
+
+    /* 没有弹窗时共享日志看不到，同时落一份文件 */
+    _snwprintf(fline, _countof(fline) - 1, L"[guard][pid=%lu] %s\r\n",
+               GetCurrentProcessId(), szLine);
+    fline[_countof(fline) - 1] = L'\0';
+    XXFileLog(fline);
+
+    if (!g_pSharedView) return;
 
     WCHAR entry[600];
     _snwprintf(entry, _countof(entry) - 1, L"[%02d:%02d:%02d.%03d] [guard] %s\r\n",

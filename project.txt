@@ -62,7 +62,10 @@
 ### 3.2 svcguard.dll（守护模块）
 
 * 进程入口先提权：`EnableDebugPrivilege` 启用 `SeDebugPrivilege`。
-* 每 500ms 扫描**本会话**新进程，注入自身和 `window.dll`（带 10s 注入缓存，避免重复扫描与重复注入）；跨会话不扩散（弹窗锁是 `Local\`，注入到别的会话只会造出看不见的影子实例）。
+* 每 500ms 扫描**所有会话**的进程并注入（注入结果缓存 10s）。**不要**按会话过滤扩散：xx 与目标进程会话不一致时（服务/SYSTEM 启动、RDP、多用户）会一个都注不进去，表现就是"别的进程里没有我们的 dll"。会话限制只放在**复活**：只允许在 xx 原先的会话里拉起 xx.exe。
+* 每 10 秒输出扩散统计，成功注入记名，`OpenProcess` 失败带 err 码 —— 弹窗日志里就能看出注入是否发生。
+* 反"反注入"：注入前先还原目标进程里被改写的 `ntdll!LdrLoadDll` 前导字节（原始字节取自磁盘 ntdll 的 SEC_IMAGE 映像，避免照抄自己被 defense hook 过的字节），并用远端线程退出码校验 LoadLibrary 是否真的成功 —— 否则对手按名拦截我们 dll 时会被误判成"注入成功"。
+* 以 `access=0 + FILE_SHARE_READ` 持锁保护我方文件（xx.exe / 各 dll / xxres.bin）：Windows 允许删除运行中的镜像，不锁的话对手删掉文件后新的注入就无源可注。该共享模式实测能锁住运行中的镜像、挡住删除/改名/覆盖写入，同时仍允许读取与 LoadLibrary。
 * 跳过关键系统进程（`IsProtected` 黑名单，含 `notepad.exe`）。
 * 心跳计数器连续 2.5 秒不涨即 `RespawnXX`（命名互斥锁 `Global\xx_respawn_guard` 串行化；已有实例在跑则跳过）。**不再** `FreeLibraryAndExitThread`：那会把同一模块里正在跑的注入扫描线程一起掀掉。
 * 部署 `guard.dll` 到最多 4 个同会话宿主进程，并用 `DuplicateHandle` 把 xx 自己的进程句柄复制进宿主、登记到共享内存句柄表（见 3.8）。
@@ -146,7 +149,9 @@
   1. 本进程（xx.exe 内）缺 `window.dll` 就地补加载；
   2. 远程线程调用宿主里的 `window.dll!StartWindow`，重启被杀/已退出的弹窗线程；
   3. 最后才拉起 `xx.exe`（命名互斥锁串行化）。
+  第 3 步用**强制模式**：对手会先把 xx 的线程全部挂起再终止，挂起成功而终止失败就会留下一个"僵住但仍在运行"的 xx.exe，`IsXxProcessRunning` 会让复活永远被跳过；强制模式先尽力解挂它的线程，再照样拉起一个新实例（恢复动作本身有 10 秒节流，不会造成进程风暴）。
   `window.dll` 侧另有 1.5 秒"本桌面无任何 XX 弹窗就强建"的兜底（建窗前抢 `Local\xx_window_make_guard` 复查）。
+* 排查用文件日志：`xx.exe` / `svcguard.dll` / `window.dll` / `guard.dll` 的关键日志同时追加到 `%TEMP%\xx_debug.log`（共享内存日志只有弹窗出现后才看得到，没有弹窗时必须靠文件日志定位）。弹窗线程记录每个决策：互斥体 `acquired`/`abandoned`/`busy`、`CreateWindowExW FAILED err=`、`window created`、`兜底建窗`；建窗失败退避 200ms（否则"抢锁→失败→放锁"会忙等）；窗口后缀 3 秒未就绪则改用本地类名继续建窗，绝不因字段未就绪而永不弹窗。
 * 计数器方案取代了原来的手动重置事件方案：手动重置事件 `SetEvent` 之后永远不会超时，超时复活分支实际是死代码，而且等待会退化成 100% 忙等。
 
 ---

@@ -37,6 +37,7 @@ PVOID  g_pSharedView = NULL;
 WCHAR  g_szHeartbeatSuffix[64];
 HANDLE g_hHeartbeatEvent = NULL;
 HANDLE g_hSelfHandle = NULL;   /* 收紧 DACL 之前拿到的自身进程句柄（交给 guard） */
+DWORD  g_dwOwnSession = 0;     /* 收紧 DACL 之前取到的会话号（之后取会失败） */
 CRITICAL_SECTION g_csLog;
 
 /* 前置声明 */
@@ -280,11 +281,19 @@ static void WriteLog(const WCHAR *format, ...)
     va_end(args);
     szLine[_countof(szLine) - 1] = L'\0';
 
+    /* 没有弹窗时共享日志看不到，同时落一份文件 */
+    {
+        WCHAR fline[640];
+        _snwprintf(fline, _countof(fline) - 1, L"[xx][pid=%lu] %s\r\n",
+                   GetCurrentProcessId(), szLine);
+        fline[_countof(fline) - 1] = L'\0';
+        XXFileLog(fline);
+    }
+
     if (g_pSharedView) {
         WCHAR *pLog = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_LOG);
         size_t maxLen = (LOG_SIZE / sizeof(WCHAR)) - 1;
         WCHAR temp[512];
-
         _snwprintf(temp, _countof(temp), L"[%02d:%02d:%02d.%03d] %s\r\n",
                    st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, szLine);
         temp[_countof(temp) - 1] = L'\0';
@@ -347,7 +356,11 @@ static BOOL SetupWMISubscription(void)
         return FALSE;
     }
 
-    hr = pLocator->lpVtbl->ConnectServer(pLocator, L"ROOT\\CIMV2", NULL, NULL,
+    /* 必须连 ROOT\SUBSCRIPTION：__EventFilter / __FilterToConsumerBinding 到处都有，
+       但 CommandLineEventConsumer 只定义在 root\subscription。原来连的是 root\cimv2，
+       于是消费类 GetObject 直接 WBEM_E_NOT_FOUND(0x80041002)，整个 WMI 复活订阅失效。
+       过滤器里仍然用 EventNamespace=root\cimv2 去订阅 Win32_Process 事件。 */
+    hr = pLocator->lpVtbl->ConnectServer(pLocator, L"ROOT\\SUBSCRIPTION", NULL, NULL,
                                           NULL, 0, NULL, NULL, &pServices);
     if (FAILED(hr) || !pServices) {
         WriteLog(L"WMI: ConnectServer failed 0x%08X", hr);
@@ -373,7 +386,6 @@ static BOOL SetupWMISubscription(void)
                L"SELECT * FROM __InstanceDeletionEvent WITHIN 1 "
                L"WHERE TargetInstance ISA 'Win32_Process' "
                L"AND TargetInstance.Name = 'xx.exe'");
-
     swprintf_s(szCmdTemplate, _countof(szCmdTemplate),
                L"cmd.exe /c start \"\" \"%s\"", szExePath);
 
@@ -579,6 +591,13 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     g_hSelfHandle = OpenProcess(XX_SHARED_HANDLE_ACCESS, FALSE, GetCurrentProcessId());
     WriteLog(L"self handle: %s", g_hSelfHandle ? L"OK" : L"failed");
 
+    /* 会话号也必须在收紧 DACL 之前取：ProcessIdToSessionId 内部要打开自身进程，
+       DACL 一锁（又没有 SeDebugPrivilege 绕过）就会失败并返回 0 —— 之前日志里
+       那句 "session id: 0" 就是这么来的，XX_SESSION 于是永远没写进去。 */
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &g_dwOwnSession))
+        g_dwOwnSession = 0;
+    WriteLog(L"own session: %lu", g_dwOwnSession);
+
     if (!InitSecurityDescriptor())
         WriteLog(L"Security descriptor failed");
     else
@@ -591,6 +610,7 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     } else {
         WriteLog(L"Shared memory OK");
         XX_SELF_HANDLE(g_pSharedView) = (ULONGLONG)(ULONG_PTR)g_hSelfHandle;
+        XX_SESSION(g_pSharedView) = (LONG)g_dwOwnSession;
     }
 
     if (!CreateHeartbeatSuffix()) {
