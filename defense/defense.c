@@ -52,6 +52,23 @@ const WCHAR *g_byovd[] = {
 CRITICAL_SECTION g_cs;
 BOOL      g_csInit   = FALSE;
 BOOL      g_defInit  = FALSE;
+HMODULE   g_hSelfModule = NULL;       /* 自身模块句柄（摘 PEB 链前缓存） */
+HANDLE    g_hSingleton = NULL;        /* 进程内单例（持有到进程结束） */
+WCHAR     g_szSelfPath[MAX_PATH] = L"";   /* 自身 dll 全路径（摘链前缓存） */
+ULONGLONG g_dwNameToken = 0;           /* 会话随机名 token（64 位）：由 xx.exe 同进程调用送进来 */
+
+static ULONGLONG NameTok(void) {
+    if (g_dwNameToken) return g_dwNameToken;
+    return XX_NAME_TOKEN_FIXED;               /* defense 只跑在 xx 内，拿不到就退回固定值 */
+}
+
+/* 远程导出：接收会话随机名（方案 A；defense 由 xx 同进程调用） */
+__declspec(dllexport) BOOL WINAPI XxSetNames(const XX_NAME_BLOCK *pBlock) {
+    ULONGLONG tok = 0;
+    if (!XXNameBlockTake(pBlock, &tok, NULL)) return FALSE;
+    if (tok) g_dwNameToken = tok;
+    return TRUE;
+}
 WCHAR     g_ownDir[MAX_PATH]   = L"";
 WCHAR     g_ownGuard[MAX_PATH] = L"";
 
@@ -85,9 +102,17 @@ BOOL NameInList(const WCHAR *name, const WCHAR **list) {
 
 void GetOwnDir(void) {
     WCHAR p[MAX_PATH] = L"";
-    GetModuleFileNameW(GetModuleHandleW(L"defense.dll"), p, MAX_PATH);
-    WCHAR *s = wcsrchr(p, L'\\');
-    if (s) s[1] = L'\0';
+    /* defense.dll 由 xx.exe 从程序目录直接加载（不是 %TEMP% 副本），
+       所以自身路径就是程序目录；但模块会被摘出 PEB，必须用 DllMain 缓存的路径。 */
+    if (g_szSelfPath[0])
+        wcsncpy_s(p, MAX_PATH, g_szSelfPath, _TRUNCATE);
+    else
+        GetModuleFileNameW(g_hSelfModule ? g_hSelfModule : GetModuleHandleW(L"defense.dll"),
+                           p, MAX_PATH);
+    {
+        WCHAR *s = wcsrchr(p, L'\\');
+        if (s) s[1] = L'\0';
+    }
     wcscpy_s(g_ownDir, MAX_PATH, p);
     swprintf_s(g_ownGuard, MAX_PATH, L"%sguard.dll", g_ownDir);
 }
@@ -197,22 +222,80 @@ void InitImageBackup(void) {
     if (g_textBackup) memcpy(g_textBackup, g_textBase, g_textSize);
 }
 
-/* ================== TerminateProcess 字节还原 ================== */
+/* ================== TerminateProcess 完整备份 + 还原 ==================
+   原来只备份前 5 字节（只够盖住一条短跳转）。对手可以在函数更靠后的位置下钩子、
+   或者改写多个位置，所以这里把**整个函数**备份下来，每次整体写回。
+   函数长度靠扫描 ret 及其后的对齐填充估算（封顶 256 字节），
+   这样不会越过函数尾去覆盖邻近函数。 */
+static SIZE_T ProcLength(const BYTE *p, SIZE_T cap) {
+    SIZE_T i;
+    for (i = 0; i < cap; i++) {
+        if (p[i] == 0xC3) {                 /* ret */
+            SIZE_T n = i + 1;
+            while (n < cap && (p[n] == 0xCC || p[n] == 0x90)) n++;   /* 对齐填充 */
+            return n;
+        }
+    }
+    return 32;                              /* 扫不到就按 32 字节处理 */
+}
+
+#define TP_BACKUP_MAX 256
+
 DWORD WINAPI ShieldThread(LPVOID lp) {
     UNREFERENCED_PARAMETER(lp);
     HMODULE h = GetModuleHandleW(L"kernel32.dll");
+    BYTE *tp;
+    BYTE cache[TP_BACKUP_MAX];
+    SIZE_T len;
+
     if (!h) return 0;
-    BYTE *tp = (BYTE*)GetProcAddress(h, "TerminateProcess");
+    tp = (BYTE*)GetProcAddress(h, "TerminateProcess");
     if (!tp) return 0;
-    BYTE cache[5];
-    memcpy(cache, tp, 5);
+
+    len = ProcLength(tp, TP_BACKUP_MAX);
+    if (len < 5) len = 5;
+    memcpy(cache, tp, len);                 /* 完整冷备份 */
+
     for (;;) {
         DWORD op;
-        if (VirtualProtect(tp, 5, PAGE_EXECUTE_READWRITE, &op)) {
-            memcpy(tp, cache, 5);
-            VirtualProtect(tp, 5, op, &op);
+        if (VirtualProtect(tp, len, PAGE_EXECUTE_READWRITE, &op)) {
+            if (memcmp(tp, cache, len) != 0)
+                memcpy(tp, cache, len);
+            VirtualProtect(tp, len, op, &op);
         }
         Sleep(30);
+    }
+    return 0;
+}
+
+/* ================== .text 冷镜像自愈（0xCC 之外的改写也要防） ==================
+   VEH 只能抓住 0xCC（int3 会触发断点异常）。对手把指令改成 **NOP(0x90)** 时
+   程序照常执行、不报异常，VEH 一点机会都没有 —— 只能靠定期与冷镜像逐字节比对，
+   发现任何差异就整体写回。这样 0x90、0xCC 以及任意字节改写都能自愈。
+   比对成本 = 一次 memcmp（几十 KB），200ms 一次可以忽略。 */
+#define TEXT_SCAN_MS 200
+
+DWORD WINAPI TextIntegrityThread(LPVOID lp) {
+    UNREFERENCED_PARAMETER(lp);
+    for (;;) {
+        if (g_textBackup && g_textBase && g_textSize) {
+            if (memcmp(g_textBase, g_textBackup, g_textSize) != 0) {
+                DWORD op;
+                if (VirtualProtect(g_textBase, g_textSize, PAGE_EXECUTE_READWRITE, &op)) {
+                    memcpy(g_textBase, g_textBackup, g_textSize);
+                    VirtualProtect(g_textBase, g_textSize, op, &op);
+                    {
+                        WCHAR fline[200];
+                        _snwprintf(fline, _countof(fline) - 1,
+                                   L"[defense][pid=%lu] Text Shield: 冷镜像比对发现改写，已整体还原。\r\n",
+                                   GetCurrentProcessId());
+                        fline[_countof(fline) - 1] = L'\0';
+                        XXFileLog(fline);
+                    }
+                }
+            }
+        }
+        Sleep(TEXT_SCAN_MS);
     }
     return 0;
 }
@@ -390,6 +473,7 @@ __declspec(dllexport) void WINAPI StartDefense(void) {
 
     CreateThread(NULL, 0, FileLockThread, NULL, 0, NULL);
     CreateThread(NULL, 0, ShieldThread,   NULL, 0, NULL);
+    CreateThread(NULL, 0, TextIntegrityThread, NULL, 0, NULL);   /* 防 NOP 等任意改写 */
     CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
 }
 
@@ -405,6 +489,17 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     UNREFERENCED_PARAMETER(reserved);
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+
+        /* 摘 PEB 链之后自身模块就查不到了，先缓存句柄与路径 */
+        g_hSelfModule = hinst;
+        GetModuleFileNameW(hinst, g_szSelfPath, MAX_PATH);
+
+        /* 进程内单例：避免同一进程里被加载多份（重复装 hook / 重复起线程） */
+        XXWaitToken(&g_dwNameToken, 300);   /* xx 是同进程调用，几乎立即返回 */
+        g_hSingleton = XXModuleSingleton(L"defense", NameTok());
+        if (!g_hSingleton) return FALSE;
+
+        XXHideSelfFromPeb(hinst);          /* 从 PEB 三条模块链表里摘除自己 */
     }
     return TRUE;
 }

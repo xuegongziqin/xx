@@ -25,6 +25,27 @@ static DWORD  g_dwLastLogTick = 0;
 #define GUARD_LOG_INTERVAL_MS 10000
 
 static HANDLE g_hXx = NULL;   /* xx 交接过来的进程句柄（只在被复制进的本进程内有效） */
+static HANDLE g_hSingleton = NULL;    /* 进程内单例（持有到进程结束） */
+static HMODULE g_hSelfModule = NULL;  /* 自身模块句柄（摘 PEB 链前缓存） */
+static ULONGLONG g_dwNameToken = 0;       /* 会话随机名 token：只由 XxSetNames 送进来 */
+
+static ULONGLONG NameTok(void) {
+    if (g_dwNameToken) return g_dwNameToken;
+    if (g_pSharedView) {
+        ULONGLONG s = XX_NAME_TOKEN64(g_pSharedView);
+        if (s) return s;
+    }
+    return XX_NAME_TOKEN_FIXED;
+}
+
+
+/* 远程导出：接收会话随机名（方案 A） */
+__declspec(dllexport) BOOL WINAPI XxSetNames(const XX_NAME_BLOCK *pBlock) {
+    ULONGLONG tok = 0;
+    if (!XXNameBlockTake(pBlock, &tok, NULL)) return FALSE;
+    if (tok) g_dwNameToken = tok;
+    return TRUE;
+}
 
 /* 前置声明（判活退化路径要用） */
 static BOOL IsProcessAlreadyRunning(const char *exePath);
@@ -205,12 +226,27 @@ static void ListFree(ProcessList *list) {
     ListInit(list);
 }
 
-/* 获取 guard.dll 所在目录，并拼出 xpt.xpt 的完整路径 */
+/* 获取 xpt.xpt 的完整路径。
+   注入副本是从 %TEMP% 的改名文件加载的，按自身模块路径找 xpt.xpt 会找到 %TEMP%
+   里去 —— 所以优先用共享内存里 xx.exe 记下的路径推目录。 */
 static void GetXptPath(char *buf, size_t size) {
     char dllPath[MAX_PATH];
-    GetModuleFileNameA(GetModuleHandleA("guard.dll"), dllPath, MAX_PATH);
-    char *pSlash = strrchr(dllPath, '\\');
-    if (pSlash) pSlash[1] = '\0';
+    WCHAR wdir[MAX_PATH];
+
+    wdir[0] = L'\0';
+    if (g_pSharedView || OpenSharedForHandle()) {
+        XXDirNameOf(XXPathBase(g_pSharedView, NULL), wdir, MAX_PATH);
+    }
+    if (wdir[0] != L'\0') {
+        if (WideCharToMultiByte(CP_ACP, 0, wdir, -1, dllPath, MAX_PATH, NULL, NULL) == 0)
+            dllPath[0] = '\0';
+    } else {
+        GetModuleFileNameA(g_hSelfModule ? g_hSelfModule : GetModuleHandleA("guard.dll"),
+                           dllPath, MAX_PATH);
+        char *pSlash = strrchr(dllPath, '\\');
+        if (pSlash) pSlash[1] = '\0';
+    }
+
     if (strlen(dllPath) + strlen(XPT_FILE_NAME) + 1 > size) {   /* 放不下就别截断写 */
         if (size) buf[0] = '\0';
         return;
@@ -360,13 +396,28 @@ static DWORD WINAPI DaemonThread(LPVOID lpParam) {
     return 0;
 }
 
-/* DllMain - 与 C++ 版完全一致 */
+/* DllMain */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
-        HANDLE hThread = CreateThread(NULL, 0, DaemonThread, NULL, 0, NULL);
-        if (hThread) CloseHandle(hThread);
+
+        /* 摘 PEB 链之后自身模块就查不到了，先把句柄缓存下来 */
+        g_hSelfModule = hinstDLL;
+
+        /* 进程内单例：模块被隐藏后注入方无法判断宿主里有没有我们，会反复注入；
+           已有实例时直接让加载失败，避免同进程叠出多套看门狗线程。 */
+        /* 等注入方把会话 token 送进来，让单例名和注入方的探针名一致 */
+        XXWaitToken(&g_dwNameToken, 300);
+        g_hSingleton = XXModuleSingleton(L"guard", NameTok());
+        if (!g_hSingleton) return FALSE;
+
+        XXHideSelfFromPeb(hinstDLL);          /* 从 PEB 三条模块链表里摘除自己 */
+
+        {
+            HANDLE hThread = CreateThread(NULL, 0, DaemonThread, NULL, 0, NULL);
+            if (hThread) CloseHandle(hThread);
+        }
     }
     return TRUE;
 }

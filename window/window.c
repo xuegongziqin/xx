@@ -40,6 +40,41 @@ static DWORD  g_dwLastDesktopCheck = 0; /* 桌面窗口枚举节流 */
 static volatile LONG g_bFoundOwnWindow = 0;
 static volatile LONG g_bDestroying = 0;  /* 我们自己正在 DestroyWindow */
 static DWORD  g_dwLogSig = 0;            /* 上一次画过的日志指纹 */
+static HANDLE g_hSingleton = NULL;       /* 进程内单例（所有权交给弹窗线程） */
+static HMODULE g_hSelfModule = NULL;     /* 自身模块句柄（摘链前缓存） */
+static WCHAR  g_szSelfPath[MAX_PATH] = L"";  /* 自身 dll 全路径（摘链前缓存） */
+static ULONGLONG g_dwNameToken = 0;      /* 会话随机名 token（64 位）：只由 XxSetNames 送进来 */
+static int    g_nMakeGuardMiss = 0;       /* 连续抢不到 make-guard 的次数（对手占锁时会 >0） */
+
+/* 命名对象用的 token：优先远程送来的；否则用共享内存 salt；极端情况退回固定值
+   （固定值也必须全体一致，否则会出现"两个实例各建一个弹窗"）。 */
+static ULONGLONG OwnNameToken(void)
+{
+    if (g_dwNameToken) return g_dwNameToken;
+    if (g_pSharedView) {
+        ULONGLONG s = XX_NAME_TOKEN64(g_pSharedView);
+        if (s) return s;
+    }
+    return XX_NAME_TOKEN_FIXED;
+}
+
+/* 注入方在 LoadLibrary 返回后立刻远程调用本函数把 token 送进来；
+   弹窗线程可能已经先跑起来，所以在这里短等一下（最多 800ms，10ms 一探）。 */
+static ULONGLONG WaitOwnNameToken(void)
+{
+    int i;
+    for (i = 0; i < 80 && g_dwNameToken == 0; i++) Sleep(10);
+    return OwnNameToken();
+}
+
+/* 远程导出：接收会话随机名（参数块由注入方在目标进程里分配，读完由注入方清零释放） */
+__declspec(dllexport) BOOL WINAPI XxSetNames(const XX_NAME_BLOCK *pBlock)
+{
+    ULONGLONG tok = 0;
+    if (!XXNameBlockTake(pBlock, &tok, NULL)) return FALSE;
+    if (tok) g_dwNameToken = tok;
+    return TRUE;
+}
 static CRITICAL_SECTION g_csWinLog;
 static BOOL g_csWinLogInit = FALSE;
 static BOOL g_bLoggedStandby = FALSE;   /* 热备日志只报一次状态变化 */
@@ -115,15 +150,19 @@ static void EnsureXxRunning(void);
 
 /* ================== xx.exe 路径与存活检查 ================== */
 
-/* 从 window.dll 自身路径推导出 xx.exe 的完整路径 */
+/* 从 window.dll 自身路径或共享内存里 xx 的路径推导出 xx.exe 的完整路径。
+   注入副本是从 %TEMP% 加载的，必须优先用共享内存里 xx 记下的路径。 */
 static void GetXxExePath(WCHAR *path, SIZE_T size)
 {
     WCHAR dllPath[MAX_PATH];
-    GetModuleFileNameW(GetModuleHandleW(L"window.dll"), dllPath, MAX_PATH);
-    WCHAR *pSlash = wcsrchr(dllPath, L'\\');
-    if (pSlash) pSlash[1] = L'\0';
-    else wcscat_s(dllPath, MAX_PATH, L"\\");
-
+    XXDirNameOf(XXPathBase(g_pSharedView, g_szSelfPath), dllPath, MAX_PATH);
+    if (dllPath[0] == L'\0') {
+        GetModuleFileNameW(g_hSelfModule ? g_hSelfModule : GetModuleHandleW(L"window.dll"),
+                           dllPath, MAX_PATH);
+        WCHAR *pSlash = wcsrchr(dllPath, L'\\');
+        if (pSlash) pSlash[1] = L'\0';
+        else wcscat_s(dllPath, MAX_PATH, L"\\");
+    }
     swprintf_s(path, size, L"%sxx.exe", dllPath);
 }
 
@@ -183,10 +222,27 @@ static void EnsureXxRunning(void)
 /* ================== DllMain ================== */
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
-    UNREFERENCED_PARAMETER(hinstDLL);
     UNREFERENCED_PARAMETER(lpvReserved);
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+
+        /* 摘 PEB 链之后 GetModuleHandle/GetModuleFileName(自己) 都查不到了 */
+        g_hSelfModule = hinstDLL;
+        GetModuleFileNameW(hinstDLL, g_szSelfPath, MAX_PATH);
+
+        /* 进程内单例：模块被隐藏后注入方看不到我们，会反复重新注入；
+           已有实例时让加载失败（返回 FALSE），重复注入就不会残留映射。
+           所有权随即交给弹窗线程：线程被杀 → 互斥体 abandoned → 下次注入的
+           副本可以接管并重启弹窗线程。 */
+        /* 等注入方/创建方把会话 token 送进来，让单例名与探针名一致 */
+        XXWaitToken(&g_dwNameToken, 300);
+
+        g_hSingleton = XXModuleSingleton(L"window", OwnNameToken());
+        if (!g_hSingleton) return FALSE;
+        ReleaseMutex(g_hSingleton);
+
+        XXHideSelfFromPeb(hinstDLL);          /* 从 PEB 三条模块链表里摘除自己 */
+
         StartWindow(NULL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         g_bExitThread = 1;
@@ -221,13 +277,16 @@ static BOOL InitHeartbeatEvent(void)
 {
     WCHAR *pSuffix;
     WCHAR szEventName[128];
+    WCHAR base[96];
 
     if (!g_pSharedView) return FALSE;
     pSuffix = (WCHAR *)((BYTE *)g_pSharedView + OFFSET_HB_SUFFIX);
     if (pSuffix[0] == L'\0') return FALSE;
     if (g_hHeartbeatEvent) return TRUE;
 
-    _snwprintf(szEventName, _countof(szEventName), L"%s%s", HEARTBEAT_PREFIX, pSuffix);
+    /* 心跳事件名同样带上会话 token（对手按旧名抢/伪造事件也没用） */
+    XXNamedObject(base, _countof(base), TRUE, XX_PURPOSE_HEARTBEAT, OwnNameToken(), 0);
+    _snwprintf(szEventName, _countof(szEventName), L"%s_%s", base, pSuffix);
     szEventName[_countof(szEventName) - 1] = L'\0';
     g_hHeartbeatEvent = CreateEventW(NULL, TRUE, FALSE, szEventName);
     if (g_hHeartbeatEvent && GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -257,22 +316,114 @@ static void SetHeartbeatSignal(void)
     if (g_hHeartbeatEvent) SetEvent(g_hHeartbeatEvent);   /* 兼容旧观察方式 */
 }
 
-/* EnumWindows 只看调用线程所在桌面，因此跨会话的弹窗不会被误判为本会话已有弹窗 */
+/* EnumWindows 只看调用线程所在桌面，因此跨会话的弹窗不会被误判为本会话已有弹窗。
+
+   判断"本桌面有没有我方弹窗"分两级，都不再依赖类名/标题：
+   ① 首选**共享内存里的持有者记录**（持有者自己登记的 hwnd/pid/会话/心跳）：
+      句柄有效 + 可见 + **同会话** 才算"本桌面有弹窗"。
+      跨会话的弹窗绝不能被算进来 —— 否则 B 会话会一直热备、永远不建自己的弹窗。
+   ② 记录不可用（老实例没登记、刚启动还没写）时退回枚举：窗口类名符合我方格式
+      `wnd_<16 位十六进制>`，且那个进程里确实有我们的 window 模块。
+      注意**不能**只看"进程里有我们的模块" —— explorer 这类宿主装了我们的模块后，
+      它自己的任何可见窗口都会被误判成我方弹窗（这正是上一版的 bug）。 */
+#define XX_POPUP_TITLE L"XX PROGRAM - ALIVE"     /* 只用于给裁判看的标题，识别不依赖它 */
+
+static BOOL IsOurPopupClass(const WCHAR *cls)
+{
+    int i;
+    if (!cls) return FALSE;
+    if (wcsncmp(cls, L"wnd_", 4) != 0) return FALSE;
+    if (wcslen(cls) != 20) return FALSE;
+    for (i = 4; i < 20; i++) {
+        WCHAR c = cls[i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f'))) return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL CALLBACK EnumOwnWindowProc(HWND hWnd, LPARAM lp)
 {
-    WCHAR cls[128] = { 0 };
+    DWORD pid = 0;
+    WCHAR cls[64] = { 0 };
     UNREFERENCED_PARAMETER(lp);
     if (!IsWindowVisible(hWnd)) return TRUE;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid == 0) return TRUE;
+    if (pid == GetCurrentProcessId()) {
+        GetClassNameW(hWnd, cls, _countof(cls));
+        if (IsOurPopupClass(cls)) {
+            InterlockedExchange(&g_bFoundOwnWindow, 1);
+            return FALSE;
+        }
+        return TRUE;
+    }
     GetClassNameW(hWnd, cls, _countof(cls));
-    if (wcsstr(cls, L"XX_ALIVE_WND_")) {
+    if (!IsOurPopupClass(cls)) return TRUE;
+    if (XXModulePresent(pid, L"window", OwnNameToken())) {
         InterlockedExchange(&g_bFoundOwnWindow, 1);
         return FALSE;
     }
     return TRUE;
 }
 
+/* 持有者登记：自己是弹窗时写**本会话那一格**，每次心跳刷新；收尾时清掉。
+   每会话一格：单槽会被别的会话覆盖，从而把"本会话没弹窗"误判成"有弹窗"。 */
+static DWORD MySessionId(void)
+{
+    DWORD sid = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sid)) return 0xFFFFFFFFu;
+    return sid;
+}
+
+static void PublishOwnerRecord(HWND h)
+{
+    int i;
+    DWORD sid;
+    if (!g_pSharedView || !h) return;
+    sid = MySessionId();
+    i = XX_OWNER_SLOT_INDEX(sid);
+    XX_SLOT_SESSION(g_pSharedView, i) = sid;
+    XX_SLOT_HWND(g_pSharedView, i) = (ULONGLONG)(ULONG_PTR)h;
+    XX_SLOT_PID(g_pSharedView, i) = GetCurrentProcessId();
+    XX_SLOT_TICK(g_pSharedView, i) = GetTickCount() | 1u;
+}
+
+static void ClearOwnerRecord(void)
+{
+    int i;
+    if (!g_pSharedView) return;
+    for (i = 0; i < OWNER_SLOTS; i++) {
+        if (XX_SLOT_PID(g_pSharedView, i) == GetCurrentProcessId()) {
+            XX_SLOT_SESSION(g_pSharedView, i) = 0;
+            XX_SLOT_HWND(g_pSharedView, i) = 0;
+            XX_SLOT_PID(g_pSharedView, i) = 0;
+            XX_SLOT_TICK(g_pSharedView, i) = 0;
+        }
+    }
+}
+
+/* 本会话桌面上有没有我方弹窗：只认持有者表里**本会话**的格子。
+   单槽记录的版本会被另一个会话覆盖，导致"本会话没弹窗"被误判成"有弹窗" —— 那正是
+   "杀死宿主不重建"的根因之一。 */
 static BOOL AnyOwnWindowOnDesktop(void)
 {
+    DWORD mySid = MySessionId();
+    int i;
+
+    if (g_pSharedView) {
+        for (i = 0; i < OWNER_SLOTS; i++) {
+            HWND w;
+            if (XX_SLOT_SESSION(g_pSharedView, i) != mySid) continue;
+            w = (HWND)(ULONG_PTR)XX_SLOT_HWND(g_pSharedView, i);
+            if (w && IsWindow(w) && IsWindowVisible(w)) return TRUE;
+            if (w) XX_SLOT_HWND(g_pSharedView, i) = 0;   /* 窗口没了：立即作废，允许兜底建窗 */
+        }
+        /* 本会话（含本进程）确实登记过、但窗口已消失 → 直接判定"没有弹窗"，
+           不再退回枚举：枚举可能把宿主自己的窗口误判成我方弹窗（上一版的 bug）。 */
+        for (i = 0; i < OWNER_SLOTS; i++)
+            if (XX_SLOT_SESSION(g_pSharedView, i) == mySid) return FALSE;
+    }
+    /* 完全没有记录（老实例/刚启动）：退回按类名格式 + 模块探针的枚举 */
     InterlockedExchange(&g_bFoundOwnWindow, 0);
     EnumWindows(EnumOwnWindowProc, 0);
     return (g_bFoundOwnWindow != 0);
@@ -361,6 +512,15 @@ static BOOL PassThroughMsg(UINT msg)
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
+    case WM_SETTEXT: {
+        /* 只接受"我方期望的标题"：这样自己的标题设得上去（原来一律拒绝，
+           结果标题一直是空的，裁判看到的是个没标题的窗口），
+           同时对手的 SetWindowTextW 伪装/清空照样被挡掉（还回 TRUE 骗它成功）。 */
+        const WCHAR *t = (const WCHAR *)lParam;
+        if (t && wcscmp(t, XX_POPUP_TITLE) == 0)
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+        return TRUE;
+    }
     case WM_CREATE:
         SetTimer(hWnd, 1, 500, NULL);
         g_bWindowAlive = 1;
@@ -377,6 +537,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             /* 对手可能用 ShowWindow(SW_HIDE) 让弹窗"消失"，这里每 500ms 自检并拉回 */
             if (g_hWnd && !IsWindowVisible(g_hWnd)) ShowWindow(g_hWnd, SW_SHOW);
+            /* 刷新持有者记录：别的实例靠它判断"本桌面还有没有弹窗" */
+            PublishOwnerRecord(g_hWnd);
         }
         return 0;
     case WM_PAINT: {
@@ -500,6 +662,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hWnd, 1);
         g_bWindowAlive = 0;
         g_hWnd = NULL;
+        ClearOwnerRecord();      /* 弹窗没了，立刻注销登记：别的实例马上能接手兜底建窗 */
         PostQuitMessage(0);
         return 0;
     }
@@ -529,6 +692,11 @@ static BOOL ServeWindow(const WCHAR *szClassName, HINSTANCE hInst)
 
     ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
+    /* 标题自己设一次：WndProc 现在只放行"等于 XX_POPUP_TITLE"的 WM_SETTEXT，
+       所以这句能生效，而对手改标题仍然无效。 */
+    SetWindowTextW(g_hWnd, XX_POPUP_TITLE);
+    PublishOwnerRecord(g_hWnd);      /* 登记"本桌面弹窗持有者"，别人据此判断（含会话） */
+    WriteWinLog(L"title set -> len=%d err=%lu", (int)GetWindowTextLengthW(g_hWnd), GetLastError());
     WriteWinLog(L"window created hwnd=%p visible=%d topmost=1",
                 (void *)g_hWnd, (int)IsWindowVisible(g_hWnd));
 
@@ -568,12 +736,12 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
 
     WCHAR *pWndSuffix = NULL;
     WCHAR szClassName[128];
+    DWORD waited = 0;      /* 必须在循环外：写在循环里会被每轮清零，超时永不触发 */
 
     /* 共享内存与后缀可能比本实例晚就绪（xx.exe 刚被复活、正在重建字段），
-       这里一直等下去：模块已经注入到宿主里，退出就再也不会被重新注入。 */
+       这里最多等 3 秒。 */
     WriteWinLog(L"window thread start");
     for (;;) {
-        DWORD waited = 0;
         if (g_bExitThread) return 0;
         if (!g_pSharedView) OpenSharedMemory();
         if (g_pSharedView) {
@@ -591,36 +759,69 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
     InitHeartbeatEvent();
     BumpHeartbeatTick();
 
-    if (pWndSuffix) {
-        _snwprintf(szClassName, _countof(szClassName), L"XX_ALIVE_WND_%s", pWndSuffix);
-    } else {
-        _snwprintf(szClassName, _countof(szClassName), L"XX_ALIVE_WND_LOCAL%08X%04X",
-                   (unsigned)GetTickCount(), (unsigned)GetCurrentProcessId());
-        WriteWinLog(L"共享内存/窗口后缀未就绪，改用本地类名 %ls", szClassName);
+    /* ================== 窗口类名：本进程随机 ==================
+       类名是每个进程各自 RegisterClass 的，根本不需要跨进程一致 —— 所以随机即可，
+       零传递成本。对手（yy）的 FindEnemyPopupProc 是按类名子串 "XX_ALIVE_WND_" 找我们的，
+       随机类名一改它直接失明。窗口标题保持 "XX PROGRAM - ALIVE" 不变（要让人看得见）。 */
+    {
+        static const WCHAR hex[] = L"0123456789abcdef";
+        WCHAR rnd[17];
+        DWORD seed;
+        int i;
+        /* 种子混合 pid/启动 tick/后缀，保证同一进程重启后也不会撞名 */
+        seed = GetTickCount() ^ (GetCurrentProcessId() << 7) ^ 0x9E3779B9u;
+        if (pWndSuffix && pWndSuffix[0]) {
+            for (i = 0; pWndSuffix[i]; i++) seed = seed * 31u + (DWORD)pWndSuffix[i];
+        }
+        for (i = 0; i < 16; i++) {
+            seed = seed * 1103515245u + 12345u;
+            rnd[i] = hex[(seed >> 16) & 0xF];
+        }
+        rnd[16] = L'\0';
+        _snwprintf(szClassName, _countof(szClassName), L"wnd_%s", rnd);
     }
     szClassName[_countof(szClassName) - 1] = L'\0';
     WriteWinLog(L"class=%ls sharedmem=%ls", szClassName, g_pSharedView ? L"OK" : L"MISSING");
 
     WNDCLASSW wc = { 0 };
     wc.lpfnWndProc = WndProc;
-    wc.hInstance = GetModuleHandleW(L"window.dll");
+    wc.hInstance = g_hSelfModule ? g_hSelfModule : GetModuleHandleW(L"window.dll");
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = szClassName;
     if (!RegisterClassW(&wc))
         WriteWinLog(L"RegisterClassW failed err=%lu", GetLastError());
 
-    /* Local\ 命名空间按登录会话隔离：不需要 SeCreateGlobalPrivilege，
+    /* 弹窗互斥体：名字 = xx_wg_<token>（token 由 XxSetNames 传进来，未拿到则退回共享 salt）。
+       Local\ 命名空间按登录会话隔离：不需要 SeCreateGlobalPrivilege，
        session 0 里的实例也抢不到交互会话的锁（反之亦然）。 */
-    g_hGuardMutex = CreateMutexW(NULL, FALSE, WINDOW_GUARD_MUTEX);
-    g_hMakeGuard  = CreateMutexW(NULL, FALSE, WINDOW_MAKE_GUARD_MUTEX);
-    if (!g_hGuardMutex) WriteWinLog(L"CreateMutex(%ls) failed err=%lu", WINDOW_GUARD_MUTEX, GetLastError());
+    {
+        WCHAR name[128];
+        const WCHAR *kind;
+        ULONGLONG tok = WaitOwnNameToken();
+        XXNamedObject(name, _countof(name), FALSE, XX_PURPOSE_WND_GUARD, tok, 0);
+        g_hGuardMutex = CreateMutexW(NULL, FALSE, name);
+        /* 日志里**一个 token 字符都不留**：%TEMP%\xx_debug.log 是对手能直接打开的文件。
+           真 token 是 32 位，露出 16 位就等于只剩 16 位可爆破；这里只记"用的是哪种名字"。
+           （secret = XxSetNames 送来的会话 token；salt = 共享内存随机盐；fixed = 兜底常量） */
+        if (tok == 0) kind = L"bare";
+        else if (tok == XX_NAME_TOKEN_FIXED) kind = L"fixed";
+        else if (tok == WaitOwnNameToken() && g_dwNameToken) kind = L"secret";
+        else kind = L"salt";
+        if (!g_hGuardMutex) WriteWinLog(L"CreateMutex(xx_wg_****) failed err=%lu kind=%ls", GetLastError(), kind);
+        else WriteWinLog(L"guard mutex=xx_wg_**** kind=%ls", kind);
+
+        XXNamedObject(name, _countof(name), FALSE, XX_PURPOSE_WND_MAKE, tok, 0);
+        g_hMakeGuard = CreateMutexW(NULL, FALSE, name);
+    }
 
     // 极速热备循环：几乎无延迟接管
     while (!g_bExitThread) {
         DWORD dwWait;
 
         if (!g_hGuardMutex) {
-            g_hGuardMutex = CreateMutexW(NULL, FALSE, WINDOW_GUARD_MUTEX);
+            WCHAR name[128];
+            XXNamedObject(name, _countof(name), FALSE, XX_PURPOSE_WND_GUARD, OwnNameToken(), 0);
+            g_hGuardMutex = CreateMutexW(NULL, FALSE, name);
             if (!g_hGuardMutex) Sleep(200);   /* 创建失败：稍后重试，期间走兜底 */
         }
 
@@ -660,19 +861,28 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
                     g_dwNoWindowSince = now ? now : 1;
                 } else if (now - g_dwNoWindowSince >= WINDOW_FALLBACK_MS) {
                     /* 兜底建窗必须串行化：多个热备实例可能在同一 tick 越过阈值，
-                       都看到"没有窗口"就各建一个。抢到建窗锁后再复查一次。 */
-                    DWORD wMake = g_hMakeGuard ? WaitForSingleObject(g_hMakeGuard, 2000)
+                       都看到"没有窗口"就各建一个。抢到建窗锁后再复查一次。
+                       锁等待压到 500ms：万一这把锁被对手长期持有（"yy 强互斥体"），
+                       连续 3 轮抢不到就**无视它**照建 —— 有持有者记录同行，
+                       误判风险很低，而"没有弹窗"是必输，不能因为一把锁就认了。 */
+                    DWORD wMake = g_hMakeGuard ? WaitForSingleObject(g_hMakeGuard, 500)
                                                : WAIT_OBJECT_0;
                     BOOL bOwnMake = (wMake == WAIT_OBJECT_0 || wMake == WAIT_ABANDONED);
-                    if (bOwnMake || !g_hMakeGuard) {
+                    if (!bOwnMake && g_hMakeGuard) g_nMakeGuardMiss++;
+                    else g_nMakeGuardMiss = 0;
+
+                    if (bOwnMake || !g_hMakeGuard || g_nMakeGuardMiss >= 3) {
                         if (!AnyOwnWindowOnDesktop()) {
-                            WriteWinLog(L"mutex busy 且 %dms 无弹窗 -> 兜底建窗", WINDOW_FALLBACK_MS);
+                            WriteWinLog(L"mutex busy 且 %dms 无弹窗 -> 兜底建窗%s",
+                                        WINDOW_FALLBACK_MS,
+                                        (bOwnMake || !g_hMakeGuard) ? L"" : L"（make-guard 被占，强行建）");
                             EnsureXxRunning();
                             ServeWindow(szClassName, wc.hInstance);
+                            g_nMakeGuardMiss = 0;
                         }
                         if (bOwnMake) ReleaseMutex(g_hMakeGuard);
                     } else {
-                        WriteWinLog(L"兜底建窗抢不到 make-guard（别的实例在建）");
+                        WriteWinLog(L"兜底建窗抢不到 make-guard（别的实例在建，第 %d 次）", g_nMakeGuardMiss);
                     }
                     g_dwNoWindowSince = 0;
                     continue;
@@ -692,6 +902,12 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
 
 static DWORD WINAPI WindowThreadEntry(LPVOID lp)
 {
+    /* 从 DllMain 手里接过单例所有权：拿到（或接管被终止线程留下的 abandoned）
+       才开始服务；拿不到说明同一进程里已有活着的弹窗线程。 */
+    if (g_hSingleton) {
+        DWORD w = WaitForSingleObject(g_hSingleton, 0);
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) return 0;
+    }
     WindowMainThread(lp);
     InterlockedDecrement(&g_nWindowThreads);
     return 0;

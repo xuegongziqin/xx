@@ -119,6 +119,15 @@
 * 源句柄是 xx 在**收紧 DACL 之前**打开、写进共享内存 `OFFSET_SELF_HANDLE` 槽位的那个；现场 `OpenProcess` 只是后备。伪句柄不能跨进程复制，因此不做那种"退化"。
 * 宿主里的 `guard.dll` 按自己的 PID 取出该句柄，先用 `GetProcessId` 校验它确实指向记录里的进程，再用 `WaitForSingleObject` 判活，**完全不调用 `OpenProcess`**。找不到句柄时退化为 `OpenProcess` + 进程名快照判活。
 
+### 3.9 隐藏、改名注入与全树清除
+
+* **PEB 三链摘除**：每个 dll 在 `DllMain` 里调用 `XXHideSelfFromPeb(hinst)`，把自己从 `InLoadOrderModuleList` / `InMemoryOrderModuleList` / `InInitializationOrderModuleList` **三条**链表上摘掉并做自环。对手按模块扫描进程（`EnumProcessModules` / `Toolhelp(SNAPMODULE)`）就看不到我们。摘链后自身 `GetModuleHandle`/`GetModuleFileName` 不可靠，所以先在 `DllMain` 缓存 HMODULE 与路径。另配 **per-process 命名互斥体单例**：副本名变化被当成新模块加载时让 `DllMain` 返回 FALSE，加载失败且不残留映射；互斥体由工作线程持有，线程被杀 → abandoned → 重新注入的副本接管并重启线程。
+* **改名注入**：`XXMakeTempCopy` 把 `svcguard.dll`/`window.dll`/`guard.dll`/`payload.dll`/`payload.bin` 复制到 `%TEMP%`，名字换成"常见系统组件名 + 随机后缀"（如 `sechost3F2A.dll`）。对手的反注入名单与删文件名单都是按文件名来的，同时失效；副本被删下一轮自动重做。随机盐 `OFFSET_TMP_SALT` 与 xx 自身路径 `OFFSET_XX_PATH` 由 xx.exe 写进共享内存，全体实例共用，且注入副本据此定位真正的程序目录。
+* **杀进程树**：`KillProcessTree` 按 `th32ParentProcessID` 递归收整棵树（深度≤6、上限 64），先取各进程镜像路径再动手，子进程先杀、根最后杀。
+* **先锁死再删除**：对每个被杀进程的源文件调用 `SetFileInformationByHandle(FileDispositionInfo)` 置删除待决 —— 标记后按名字再打开一律被拒（既不能执行也不能改写），最后一个句柄关闭即消失，对正在运行的镜像同样有效。根进程目录再由新线程整目录清空（隔 1.2s 再清一遍对付同目录重建），按名字跳过我方 9 个文件。
+* **defense 强化**：`kernel32!TerminateProcess` 改为按 `ret`+对齐填充求出函数长度（封顶 256B）后**整函数备份与还原**；新增 `TextIntegrityThread` 每 200ms 把主模块 `.text` 与冷镜像逐字节比对并整体还原 —— **NOP(0x90) 不触发异常，VEH 拦不到，只能靠这种比对兜住**，VEH 保留为 0xCC 的快路径。
+* **复活扫描 80ms**：`HEARTBEAT_POLL_MS_DEMON=80`，恢复重试间隔 1s。
+
 ---
 
 ## 4. DLL 扩散与管理策略
@@ -184,3 +193,84 @@ xx.exe
 └──> defense.dll (合并防御，StartDefense)
 │
 ```
+### 3.10 命名对象随机化 + 方案 A 传递
+
+* 命名对象名统一为 `xx_<用途>_<token>`（弹窗锁 wg / 建窗锁 wmg / 复活锁 rg / 攻击 leader al / 模块单例 / 心跳事件 hb）。
+* xx 启动生成 32 位会话随机名 token（**不写共享内存**）；注入成功后写入目标 `XX_NAME_BLOCK` 并 `CreateRemoteThread` 调用其导出 `XxSetNames`，返回后立刻清零并 `VirtualFreeEx`（读后即删）。RVA 由 `LoadLibraryExW(DONT_RESOLVE_DLL_REFERENCES)` 取得（不执行对方 DllMain）。xx 自己加载的模块走同进程直接调用。
+* 一致性兜底：无 token → 共享内存 salt → 固定值，三者全体一致，杜绝"各建一个弹窗/互相等锁"；共享 salt 在映射已存在时沿用旧值（xx 重启不换名）。
+* 窗口类名每进程随机（`wnd_<16 hex>`）；窗口识别改为"本进程 或 对方进程里有我们的 window 模块"（token 化单例探针），不再依赖类名/标题（实测跨进程读标题不可靠）。
+* 顺带修掉：`window.dll` 等后缀循环里 `waited` 定义在循环体内导致超时永不触发 —— 无共享内存时弹窗永远不会出现，兜底路径形同虚设。
+
+### 3.11 对 yy 的攻击（依据 yybad.md）
+
+* 窗口层（P0）：改标题、`SetParent` 挂不可见父窗口、`SW_HIDE`、`SC_MINIMIZE`、`WM_ENABLE(FALSE)`、日志框 `WM_GETTEXT`+`WM_SETTEXT` 嘲讽。**`DestroyWindow` 跨进程必然失败**（yybad 该条有误），真正致命的是隐藏 —— yy 主循环只查 `IsWindow`，隐藏后永不重建，8 秒判负。
+* WMI 三件套删除：`__FilterToConsumerBinding` → `CommandLineEventConsumer` → `__EventFilter`，三轮 + `YY_` 前缀清扫。
+* #16 非断点 patch：把 yy 进程里 `user32!CreateWindowExW` 入口改成 `xor eax,eax; ret`（实测调用恒返回 NULL，进程照常运行）。**IAT patch 会被 -O2 的寄存器缓存绕过，已弃用**（对照实验：IAT 槽写入成功但目标照样建窗）。
+* #17 12 字节 patch `kernel32!TerminateProcess` 为 `mov rax,0; jmp rax`（对方 ShieldWorker 只还原前 5 字节 → 函数劈坏；实测目标下次调用即以 0xC0000005 崩溃）。
+* #19 用我方 `xxres.bin`（xx.exe 的备份）内容覆盖对方 `yyres*.bin`，它复活出来的其实是 xx.exe 的字节。
+* 待做：#10 注入 yy 后子类化其日志 WndProc、#11 注入后 `UnregisterClass` 干掉它的窗口类、#15 反向 WMI 订阅监听 yy.exe 创建。
+
+### 3.12 弹窗持有者表（修掉"杀宿主不重建"与"跨会话误判"）
+
+* 判定"本桌面有没有我方弹窗"曾经用类名/标题，后来改成"哪个进程加载了我们的 window 模块" —— **后者是错的**：explorer 这类宿主装了我们的模块后，它自己的任何可见窗口都会被算成我方弹窗，于是真弹窗死了兜底建窗也永远不触发。
+* 现在由持有者在共享内存的**持有者表**里登记自己那一格：`session / hwnd / pid / tick`；别人只读**本会话那一格**，要求 `IsWindow` + `IsWindowVisible`；窗口没了就作废该格，兜底建窗立刻可触发。
+* 表按会话分 4 格（`OFFSET_OWNER_TABLE`，4×24 字节，位于 928..1023）：单槽会被另一个会话覆盖，于是"本会话没弹窗"被误判成"有弹窗" —— 那正是两个 session 互相误判的根因。
+* 建窗串行锁等待 2s → 500ms，连续 3 轮抢不到就**无视它照建**：锁被对手长期持有（"yy 强互斥体"）也不能因为一把锁就认输。
+* `XX_PATH_MAX` 从 160 收到 128 字符，腾出这 96 字节。
+
+### 3.13 注入 yy 内部（#10 / #11）与反向 WMI（#15）
+
+* 扩散器本就会把 atkcore 注入 yy（yy.exe 不在保护名单、注入的是改名副本，`BAD_MODULES` 子串拦截失效）。
+* #10 进 yy 后 `SetWindowLongPtrW(GWLP_WNDPROC)` 换掉它日志 EDIT 的窗口过程，它写日志即被替换成嘲讽（同进程内字符串指针有效，这才是 yybad 1.6 利用 4 的正确做法）。
+* #11 `UnregisterClassW("YYWnd_7f3a9c1e")` + 把本进程内的 `RegisterClassExW/RegisterClassW/CreateWindowExW/CreateWindowExA` 入口改成 `xor eax,eax; ret`，它再也建不出弹窗；顺手 `SW_HIDE` 它的主窗口。进了 yy 的副本**不杀自己所在的宿主**，留作眼线。
+* #15 xx 端新增 `XX_YyWatchFilter`（`__InstanceCreationEvent` 订阅 `Win32_Process` 中 `Name='yy.exe'`）+ `XX_YyWatchConsumer`（`cmd /c taskkill /f /im yy.exe`）+ 绑定，yy 一被拉起 1 秒内被按掉；用 `XX_` 前缀，不会被我们删 `YY_` 的逻辑误删。
+
+### 3.14 yy 处理策略（按用户要求）
+
+* `yy.exe` / `ww.exe`（核心）：**全部杀掉**（先 #16/#17 改内存，再杀整棵树 + 源文件先锁死再删除）。
+* 它们的子进程（含孙进程，例如蜜罐 `lenovo_fix.exe`）：**全部注入**（改名副本的 svcguard + window，注入后自带 atkcore）。
+* 子进程**有** yy 弹窗 -> **疯狂创建嘲讽信息**（25 次/秒刷它的日志框 + 改标题为 `xx_ALIVE_WND > yy`），**不杀**；**没有**弹窗 -> 杀掉。
+* 为什么有弹窗的反而不杀：`lenovo_fix.exe` 是 yy 的蜜罐兼复活锚点，杀一次它按复活链重建一次（并重建 WMI 订阅），纯杀白费力气；占住它的弹窗把它的"存活证明"变成我们的广告牌更划算。
+* xx 侧对"非 yy.exe/ww.exe 但窗口像 yy 弹窗（类名 YYWnd* / 标题 YY_Defensive_GUI）"的窗口同样**只嘲讽不动手**（不隐藏/不挂父窗口/不最小化），避免自己把"有弹窗"条件消掉。
+* 进到 yy/子进程内部的副本**不杀自己所在的宿主**：宿主是核心目标时额外做 #10/#11；只要宿主有 yy 弹窗就开嘲讽线程。
+* 实测：用假蜜罐（类名 YYWnd_FAKE1234 + 标题 YY_Defensive_GUI + EDIT 日志框）与假子进程（无窗口）验证 —— 有弹窗分支判为"疯狂嘲讽"并把它的日志框刷成 `[xx] yy.exe is just a waste`、标题改成 `xx_ALIVE_WND > yy`；无弹窗分支判为"杀掉"。
+### 3.15 yy 处理策略第 3 版 + 三个实测踩坑
+
+* `yy.exe`/`ww.exe` 主进程：全部杀掉（#16/#17 改内存 → 杀整棵树 → 源文件先锁死再删除）；同时模仿用户的 `waste.c`，**每 2 秒**重新枚举找它的窗口、标题改 `xx_ALIVE_WND`、往日志框追加 `[dd-mm-ss] System Shield Active. yy.exe is just a waste.`。
+* yy 家族子进程（蜜罐 `lenovo_fix.exe` 等）：**杀掉 + 锁死 + 删除源文件**（KillProcessTree 内部即删除待决 + 整目录清空）。
+* 三个实测暴露的真 bug：
+  1. **父进程链不可靠**：每 30ms 杀 yy.exe 会把蜜罐变成孤儿，父 PID 指向死进程 → `GetProcessPath(父)` 失败 → 蜜罐永远进不了名单。改为四源并集 + **记住** yy 目录与家族镜像路径。
+  2. **`FindWindowW` 不可用**：蜜罐与 yy **类名完全相同**（`YYWnd_7f3a9c1e`），FindWindow 只返回一个。所有找对手窗口处改为枚举并优先 yy.exe/ww.exe 进程。
+  3. **"进程里有我们的 window 模块"不能用来判断窗口归属**：我们会把 window.dll 注入进 yy 子进程，蜜罐窗口因此被误判成我方窗口而跳过（标题一直没变的原因）。判据改为类名格式 `wnd_<16hex>` 或弹窗持有者表登记。
+* 实测：同一份二进制复制成 yy.exe 与 lenovo_fix.exe（同类名），杀掉 yy.exe 让蜜罐成孤儿 → 家族发现仍命中蜜罐；新判据认定蜜罐窗口非我方 → 会被攻击。
+### 3.16 yy 处理策略第 4 版（本体嘲讽 10 条再杀）
+
+* 本体（yy.exe/ww.exe）：**先发布 10 条嘲讽，够了才结束进程树 + 源文件先锁死再删除**。模仿 waste.c：每 2 秒一条（重新枚举找窗口 → 标题改 `xx_ALIVE_WND` → 日志框追加 `[dd-mm-ss] (n/10) System Shield Active. yy.exe is just a waste.`），计数按 PID、本体死后作废。
+* 子进程（蜜罐 lenovo_fix.exe 等）：**直接杀掉 + 锁死 + 删除源文件**（不嘲讽）。
+* 嘲讽期间 xx 本体侧只嘲讽不压制（不隐藏/不挂父窗口/不最小化），否则日志框看不见；子进程照常压制。
+* **新增踩坑：所有杀本体的出口必须走同一门控**——Phase C（抓复活）原来直接 KillProcessTree，把本体秒杀，导致"先嘲讽 10 条"根本没发生（实测暴露）。现在 Phase A/C 都走 `KillYyBodyIfTaunted`。
+* **新增踩坑：模块枚举对我们自己是双向失准**——dll 从 PEB 三链摘除后 `CreateToolhelp32Snapshot(SNAPMODULE)`/`EnumProcessModules` 永远找不到（读的就是那三条链），名字又是随机系统 dll 名。凡"该不该注入/宿主有没有我们的模块"一律改用互斥体探针 `XXModulePresent`，模块枚举只当兜底、返回 false 不等于没有。
+* 实测（假 yy，同名类 YYWnd_7f3a9c1e + 真 atkcore 注入宿主）：标题变 `xx_ALIVE_WND`，嘲讽按 2 秒累加到 10 条后本体退出，其源文件被锁死删除（yydir\yy.exe 消失）。
+### 3.17 注入判定/守护宿主判定互斥体：名字候选表 + 随机回退
+
+* 这两处判定用的就是模块单例互斥体（`XXModuleSingleton` / `XXModulePresent`），名字 `xx_<tag>_<候选token>_<pid>`，**已经是随机的**，传递方式与 window 一致（`XxSetNames` 导出 + 远程 push）。
+* 但存在两种合法形态：远程注入的副本（DllMain 等到了 token）用 token 名；xx 同进程同步 LoadLibrary 的模块（push 只能在 DllMain 返回后）用回退名。只认一种会互相看不见 → 反复重复注入、单例被加载两次。
+* 修法：创建与探测共用候选表 **token → 共享 salt（随机）→ 固定常量 → 裸名**；创建取第一个（随机优先），探测逐个试（全都认得）。回退名由写死常量改成共享内存里的随机 salt。
+* 另修：svcguard 的 DllMain 之前直接用 `g_dwNameToken`（此刻还是 0）建单例 → 现在先 `XXWaitToken(300ms)` 再建。
+* 实测：无共享内存时单例名 `Global\xx_guard_1A2B3C4D_<pid>`（固定兜底）；有共享内存时 `Global\xx_guard_1234ABCD_<pid>`（随机 salt），固定名不再出现；探针三种形态都能命中。
+* 嘲讽节奏 2000ms → **200ms**（10 条约 2 秒发完）。
+### 3.18 token 随机性来源与日志泄密修补
+
+* 命名对象的随机部分 = **32 位会话 token**（`_%08X`），不是 PID；PID 只用于"每进程一格"的作用域后缀（可枚举，不提供任何保密性）。跨进程锁（wg/wmg/rg/al）名字里根本没有 PID。
+* token 生成：`srand(GetTickCount()*2654435761 + pid*7); (((rand()<<16)^rand())|1)` —— 伪随机（rand），约 32 位熵，种子含启动时刻与 pid。
+* 三种来源（按优先级，全体实例必须一致）：① `XxSetNames` 送进来的秘密 token（**不写共享内存/不落盘**，参数块读完清零）；② 共享内存里的随机 salt（也是 32 位随机，但对手能解析我们的映射读到）；③ 固定常量 `0x1A2B3C4D`（不随机，仅在无共享内存时）。
+* **修补两个日志泄密点**：xx.exe 原来把 token 原文写进 `%TEMP%\xx_debug.log`；window.dll 打印了含 token 的完整互斥体名（还一度只掩尾 4 位 = 泄露 16 位）。现在日志只写 `xx_wg_**** kind=secret|salt|fixed`，一个 token 字符都不留（实测日志中搜不到 token 原文）。
+### 3.19 token 改为 RtlGenRandom + 64 位
+
+* 生成：`RtlGenRandom`（advapi32 的 `SystemFunction036`，GetProcAddress 动态取，Win7 自带）生成 64 位；失败退回 rand() 兜底。最低位置 1（0 是"没有 token"的哨兵）。
+* 名字：`xx_<用途>_<16 位十六进制>[_<pid>]`；共享内存新增 `OFFSET_NAME_TOKEN64`（4024..4031，布局版本升到 **v3**）存放 **64 位回退 token**，映射已存在则沿用（xx 重启不换名）。
+* 参数块：`XX_NAME_BLOCK.token` 改 `ULONGLONG`，`XX_NAME_VERSION` 升到 **2**，旧版 v1 块一律拒绝。
+* 两处会让 64 位白改的坑（都实测抓到）：
+  1. `_snwprintf` 落 MSVCRT 不认 `%llX`（只认 `%I64X`）→ 64 位被截成 32 位；改为手写 16 位十六进制 `XXHex64()`。
+  2. `window.c` 里 `DWORD tok = WaitOwnNameToken();`（以及 `WaitOwnNameToken()` 返回 `DWORD`）→ `XXNameBlockTake` 写 8 字节只留低半截，名字成 `xx_wg_0000000055667788`；现在全部 `ULONGLONG`。
+* 验证：送 `0x1122334455667788` 后 `Local\xx_wg_1122334455667788` 真实存在；旧版 v1 块被拒绝；本机 `SystemFunction036` 可用且取到非 0 随机。

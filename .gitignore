@@ -23,6 +23,7 @@
 
 # ---------- 测试用编译产物（源码一律保留）----------
 /test/killer.exe
+/test/testmy/*.exe
 /test/testyy/*.exe
 /test/testyy/*.dll
 /sysstart/sysstart.exe

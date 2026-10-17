@@ -45,7 +45,7 @@ echo Done.
 echo.
 echo [4/8] Compiling atkcore.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\atkcore.dll" killtools\killtools.c ^
-    -luser32 -lkernel32 -ladvapi32
+    -luser32 -lkernel32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid
 if errorlevel 1 (
     echo ERROR: Failed to compile atkcore.dll
     goto :error
