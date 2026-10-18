@@ -1,1 +1,0 @@
-g++ -std=c++17 -O2 -Wall -Wextra -Wno-missing-field-initializers -Wno-unknown-pragmas -Wno-cast-function-type -mconsole -static -static-libgcc -static-libstdc++ -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE yy.cpp -o yy.exe -luser32 -lgdi32 -ladvapi32 -lpsapi -lkernel32 -lntdll -lole32 -loleaut32 -lwbemuuid -s

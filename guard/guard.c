@@ -1,4 +1,4 @@
-/*
+﻿/*
  * guard.dll - 进程守护模块（C语言版，基于 deamon_dll.cpp）
  * 功能：读取同目录下的 xpt.xpt，监控列表中的进程，终止则重启，存活则恢复挂起线程
  *       启动前会检查目标程序是否已有进程存在，防止重复启动。
@@ -16,6 +16,9 @@
 
 /* 共享内存布局与命名常量：唯一来源见 xxipc.h */
 #include "xxipc.h"
+
+/* ---- 构建标记导出：注入方/加载方用它校验"拿到的确实是同一版二进制" ---- */
+__declspec(dllexport) const char * WINAPI XxBuildTag(void) { return "v7"; }
 
 static CRITICAL_SECTION g_csLog;
 static BOOL g_csLogInit = FALSE;
@@ -349,6 +352,7 @@ static DWORD WINAPI DaemonThread(LPVOID lpParam) {
     const DWORD COOLDOWN_MS = 5000;
 
     (void)lpParam;
+    Sleep(80);   /* 别在 DllMain 的 loader lock 里干活 */
 
     /* 共享内存可能晚于本实例就绪；拿不到就退化成 OpenProcess 判活 */
     OpenSharedForHandle();
@@ -391,16 +395,34 @@ static DWORD WINAPI DaemonThread(LPVOID lpParam) {
             }
         }
         ListFree(&list);
-        Sleep(200);
+        Sleep(40);
     }
     return 0;
 }
 
 /* DllMain */
+/* 崩溃日志：写进 %TEMP%\xx_debug.log（XXFileLog），宿主崩了也能留下是谁在哪崩的 */
+static LONG WINAPI GuardCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    WCHAR line[320];
+    DWORD code = 0;
+    void *addr = NULL;
+    if (ep && ep->ExceptionRecord) {
+        code = ep->ExceptionRecord->ExceptionCode;
+        addr = ep->ExceptionRecord->ExceptionAddress;
+    }
+    _snwprintf(line, _countof(line) - 1,
+               L"[CRASH] guard.dll pid=%lu code=0x%08lX addr=%p\r\n",
+               GetCurrentProcessId(), (unsigned long)code, addr);
+    line[_countof(line) - 1] = L'\0';
+    XXFileLog(line);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+        SetUnhandledExceptionFilter(GuardCrashFilter);
 
         /* 摘 PEB 链之后自身模块就查不到了，先把句柄缓存下来 */
         g_hSelfModule = hinstDLL;
@@ -408,7 +430,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         /* 进程内单例：模块被隐藏后注入方无法判断宿主里有没有我们，会反复注入；
            已有实例时直接让加载失败，避免同进程叠出多套看门狗线程。 */
         /* 等注入方把会话 token 送进来，让单例名和注入方的探针名一致 */
-        XXWaitToken(&g_dwNameToken, 300);
         g_hSingleton = XXModuleSingleton(L"guard", NameTok());
         if (!g_hSingleton) return FALSE;
 
@@ -421,3 +442,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     }
     return TRUE;
 }
+
+
+
+
+
+
+

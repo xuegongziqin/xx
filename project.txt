@@ -67,7 +67,8 @@
 * 反"反注入"：注入前先还原目标进程里被改写的 `ntdll!LdrLoadDll` 前导字节（原始字节取自磁盘 ntdll 的 SEC_IMAGE 映像，避免照抄自己被 defense hook 过的字节），并用远端线程退出码校验 LoadLibrary 是否真的成功 —— 否则对手按名拦截我们 dll 时会被误判成"注入成功"。
 * 以 `access=0 + FILE_SHARE_READ` 持锁保护我方文件（xx.exe / 各 dll / xxres.bin）：Windows 允许删除运行中的镜像，不锁的话对手删掉文件后新的注入就无源可注。该共享模式实测能锁住运行中的镜像、挡住删除/改名/覆盖写入，同时仍允许读取与 LoadLibrary。
 * 跳过关键系统进程（`IsProtected` 黑名单，含 `notepad.exe`）。
-* 心跳计数器连续 2.5 秒不涨即 `RespawnXX`（命名互斥锁 `Global\xx_respawn_guard` 串行化；已有实例在跑则跳过）。**不再** `FreeLibraryAndExitThread`：那会把同一模块里正在跑的注入扫描线程一起掀掉。
+* 心跳计数器连续 2.5 秒不涨即 `RespawnXX`（命名互斥锁 `xx_rg_<token>` 串行化；已有实例在跑则跳过）。**不再** `FreeLibraryAndExitThread`：那会把同一模块里正在跑的注入扫描线程一起掀掉。
+* **判活不使用句柄**：`IsXxProcessRunning` 只用进程表快照 + 共享内存 `OFFSET_XX_PID` 记录的实例 PID（`xxipc.h::XXSnapIsOurInstance`）。xx 与接管副本都会把自身 DACL 收成拒绝 Everyone，`OpenProcess`/`XXPidIsOurXx` 对它们必然失败，拿它当判据只会永远得到"没有实例"、每次心跳停摆白拉一份。**解挂被挂起的线程不归 svcguard 管**：那需要 xx 的进程句柄，由宿主里的 `guard.dll` 用交接句柄完成（§3.8），svcguard 里重复的"扫线程表 + `ResumeThread`"已删除。
 * 部署 `guard.dll` 到最多 4 个同会话宿主进程，并用 `DuplicateHandle` 把 xx 自己的进程句柄复制进宿主、登记到共享内存句柄表（见 3.8）。
 * 卸载对手注入的 `guard.dll`（仅保留与我方同目录的那一份）。
 * 实例常驻：只做复活，不自我卸载（见 §4.2）。
@@ -107,7 +108,7 @@
   * VEH 冷镜像自愈（拦截 .text 被写 `0xCC`）
   * `kernel32!TerminateProcess` 字节还原
   * `LdrLoadDll` 反注入 Hook（trampoline 实现，同名 `guard.dll` 用路径放行我方）
-  * 心跳看门狗（掉线则从 `xxres.bin` 还原并拉起 `xx.exe`）
+  * 心跳看门狗（掉线则从 `xxres.bin` 还原并拉起实例；判活排除本进程，本体按镜像名、接管副本按"共享内存记录的实例 PID / 路径级判据"认，拉的目标由 `XXRespawnTargetPath` 择优，与 svcguard 共用 `xx_rg_<token>` 互斥体）
 * 刻意不装 `NtCreateThreadEx` / `NtQueueApcThread` Hook：本地 hook 拦不到“别人往我这儿建线程”，只会干扰 xx 自己。
 * 导出全部函数（`-Wl,--export-all-symbols`），主入口 `StartDefense`。
 
@@ -118,6 +119,7 @@
 * 注入的同时用 `DuplicateHandle` 把 **xx 自己的进程句柄**（权限仅 `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`）复制进宿主进程，按宿主 PID 登记到共享内存句柄表（条目含启动 tag 与"句柄指向的 xx PID"，xx 重启后旧条目自动失效；宿主还在就每轮重发，发不进去就改投其它宿主）。
 * 源句柄是 xx 在**收紧 DACL 之前**打开、写进共享内存 `OFFSET_SELF_HANDLE` 槽位的那个；现场 `OpenProcess` 只是后备。伪句柄不能跨进程复制，因此不做那种"退化"。
 * 宿主里的 `guard.dll` 按自己的 PID 取出该句柄，先用 `GetProcessId` 校验它确实指向记录里的进程，再用 `WaitForSingleObject` 判活，**完全不调用 `OpenProcess`**。找不到句柄时退化为 `OpenProcess` + 进程名快照判活。
+* **职责划分**：需要 xx 进程句柄的只有 `guard.dll`（判活 + 解挂被挂起的线程）。`svcguard` / `window` / `defense` 只回答"还有没有我方实例在跑"，**一律不需要句柄**（xx 的 DACL 拒绝 Everyone，`OpenProcess` 必然失败），统一用 `xxipc.h::XXSnapIsOurInstance`（进程表 + 共享内存记录的实例 PID）判活；`svcguard` 里原来重复的解挂代码已删除。
 
 ### 3.9 隐藏、改名注入与全树清除
 
@@ -157,8 +159,8 @@
 * **恢复机制**：共享内存心跳计数器（`xxipc.h` 的 `OFFSET_HB_TICK`）由弹窗每 500ms 递增一次；`svcguard.dll` / `defense.dll` 每 500ms 轮询，连续 2.5 秒不涨即进入恢复流程（动作按 10 秒节流）：
   1. 本进程（xx.exe 内）缺 `window.dll` 就地补加载；
   2. 远程线程调用宿主里的 `window.dll!StartWindow`，重启被杀/已退出的弹窗线程；
-  3. 最后才拉起 `xx.exe`（命名互斥锁串行化）。
-  第 3 步用**强制模式**：对手会先把 xx 的线程全部挂起再终止，挂起成功而终止失败就会留下一个"僵住但仍在运行"的 xx.exe，`IsXxProcessRunning` 会让复活永远被跳过；强制模式先尽力解挂它的线程，再照样拉起一个新实例（恢复动作本身有 10 秒节流，不会造成进程风暴）。
+  3. 最后才拉起一个实例（命名互斥锁串行化）。**拉哪个文件**由 `xxipc.h` 的 `XXRespawnTargetPath` 决定：优先共享内存 `OFFSET_XX_PATH` 记录的"最后完成初始化的实例"（接管副本接管后它指向 `%TEMP%` 下的改名副本），记录指向的文件没了才退回 `<目录>\xx.exe` —— 对手每 50ms 按名杀 `xx.exe`，复活本体等于白复活。
+  第 3 步用**强制模式**：对手会先把 xx 的线程全部挂起再终止，挂起成功而终止失败就会留下一个"僵住但仍在运行"的 xx.exe，`IsXxProcessRunning` 会让复活永远被跳过；强制模式不再看"是否已在运行"，照样拉起一份新实例。**解挂不在这里做**（那需要 xx 的进程句柄）：宿主里的 `guard.dll` 用交接句柄每隔 200ms 检查 `xpt.xpt` 里的进程，活着就解挂它的线程（§3.8）。（恢复动作按 1 秒节流，不会造成进程风暴。）
   `window.dll` 侧另有 1.5 秒"本桌面无任何 XX 弹窗就强建"的兜底（建窗前抢 `Local\xx_window_make_guard` 复查）。
 * 排查用文件日志：`xx.exe` / `svcguard.dll` / `window.dll` / `guard.dll` 的关键日志同时追加到 `%TEMP%\xx_debug.log`（共享内存日志只有弹窗出现后才看得到，没有弹窗时必须靠文件日志定位）。弹窗线程记录每个决策：互斥体 `acquired`/`abandoned`/`busy`、`CreateWindowExW FAILED err=`、`window created`、`兜底建窗`；建窗失败退避 200ms（否则"抢锁→失败→放锁"会忙等）；窗口后缀 3 秒未就绪则改用本地类名继续建窗，绝不因字段未就绪而永不弹窗。
 * 计数器方案取代了原来的手动重置事件方案：手动重置事件 `SetEvent` 之后永远不会超时，超时复活分支实际是死代码，而且等待会退化成 100% 忙等。
@@ -274,3 +276,239 @@ xx.exe
   1. `_snwprintf` 落 MSVCRT 不认 `%llX`（只认 `%I64X`）→ 64 位被截成 32 位；改为手写 16 位十六进制 `XXHex64()`。
   2. `window.c` 里 `DWORD tok = WaitOwnNameToken();`（以及 `WaitOwnNameToken()` 返回 `DWORD`）→ `XXNameBlockTake` 写 8 字节只留低半截，名字成 `xx_wg_0000000055667788`；现在全部 `ULONGLONG`。
 * 验证：送 `0x1122334455667788` 后 `Local\xx_wg_1122334455667788` 真实存在；旧版 v1 块被拒绝；本机 `SystemFunction036` 可用且取到非 0 随机。
+### 3.20 方案 b：改名接管副本（xx.exe → %TEMP%\svchost|explorer|conhost --wait → 接管）
+
+* 动机：yy 的 HunterWorker 每 50ms 按**进程名**杀 `xx.exe`（先挂起全部线程再 TerminateProcess，并删 xx.exe/xxres.bin/黑名单 dll）。它认宿主的另两条路（窗口类名 `XX_ALIVE_WND_`、dll 名）都已废，只剩按名杀。
+* 做法：交付仍是唯一 exe `xx.exe`；启动后在共享内存/后缀就绪时把自己复制到 `%TEMP%`，用 `RtlGenRandom` 在 `svchost.exe`/`explorer.exe`/`conhost.exe` 中随机取名，`xxres.bin` 也备份到 `%TEMP%`；以 `--wait <pid>` 隐藏启动副本。
+* 副本在 `InitThread` 最开头休眠：等本体句柄 + 盯心跳（停摆 2500ms 也接管）；接管后把自身路径写入 `XX_XXPATH`，此后复活链拉副本而非 xx.exe。
+* 防重复/防链：接管前抢 `Local\xx_tko_<token>`；副本不繁殖（只有叶子名 xx.exe 的本体布置副本）；本体 SelfProtectThread 每秒检查副本存在性，被删即重布置。
+* 身份判据改为路径级：`XXPathLooksLikeOurXx`/`XXPidIsOurXx` —— 叶子名 xx.exe，或 %TEMP% 下那三个名字。只用名字会把系统真 svchost/explorer/conhost 当我们（永不复活），也认不出副本（atkcore 会杀自己的载体）。
+* 顺带修的两处根因：① `SpreaderThread` 开头的 `Sleep(5000)` 删掉（yy 50ms 一轮按名杀，等 5 秒等于自杀）→ 最多 300ms 等共享内存 + 立刻把 svcguard/window 注入控制台会话的 explorer（新增 `BootstrapInject`）；② window.dll 后缀等待 3s→300ms、token 等待 800ms→100ms、各 dll DllMain 的 300ms token 等待删除。
+* 会话 0 修复：`XXLaunchInConsoleSession()`（wtsapi32 动态加载 + `WTSQueryUserToken` + `CreateProcessAsUser` + `winsta0\default`）。svcguard 的 `RespawnXX`、window 的 `EnsureXxRunning`、以及 xx 自己的启动自检（发现不在控制台会话就重开并退出）都走它。实测症状是弹窗出现在不可见桌面 + Windows 弹"交互式服务检测"。
+* 验证：路径判据用探针测过（系统 svchost/explorer/conhost → FALSE，%TEMP% 下同名 → TRUE）；"复制+--wait 休眠+本体死后接管"用独立 mimic 测过（副本休眠 ~2.4s 无动作，本体一退出立刻接管）。真 xx.exe 的完整链需在 Win7 实机验证。
+### 3.21 A2/A6/B1/B3/B4 + C1/C2（实测筛选后的结果）
+
+* **A6 实测无效**：`NtUserDestroyWindow`（从 win32u.dll 导出动态取，不写死 syscall 号）跨进程调用返回 `STATUS_SUCCESS(0)`，但目标窗口**依然存在** —— win32k 只认真属主进程。保留为无害尝试 + 记日志。
+* **A2 实测有效**：`TerminateThread(GetWindowThreadProcessId 得到的 GUI 线程)` → 300ms 内 `IsWindow` 变 0，宿主进程仍在。这绕开了进程级保护/VEH，只拆那一根线程。已接在：①本体嘲讽满 10 条后（先打窗口再杀进程树）；②家族子进程。
+* **B1**：`NtQuerySystemInformation(SystemProcessInformation)` 一次 syscall 枚举全部进程，替换 Phase C 的 `CreateToolhelp32Snapshot`（后者每轮复制两遍进程表，"枚举慢"的根因）。
+* **B3**：`NtSuspendProcess` + `NtTerminateProcess`（KillFast），并缓存进程句柄；已作为 `TryAllMethods` 的"方法0"最先尝试。
+* **B4**：`GetWindowThreadProcessId` 反查 PID（已有窗口句柄时零成本）。
+* **C1**：只读属性（实测 `DeleteFileW` → err=5 ACCESS_DENIED）+ deny-DELETE DACL（连删硬链接别名也被挡）+ 原共享锁句柄。`xx.exe` 不加 deny-DELETE（我们自己的还原目标，加了连 CopyFileW 覆盖都会失败），还原前先清只读。
+* **C2**：`CreateHardLinkW` 在 %TEMP% 挂随机名硬链接（实测建立成功、独立存活）。
+* **崩溃自吞**：`SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX)` + `SetUnhandledExceptionFilter` → 记 `code/addr/宿主/模块基址` 后 `ExitProcess`，不返回给 WER，所以不会再弹"xxx.exe 已停止工作"。
+* **副本加载模块改用绝对路径**：`LoadOurModule()`（自身目录 → 共享内存里 xx 路径目录 → 该目录的改名副本 → 相对名）。之前副本在 %TEMP% 里用相对名 `LoadLibraryW(L"window.dll")` 必然失败，副本"活着但不干活"。
+* **重布置限速 15s**：避免"副本一启动就崩 → 看门狗重布置 → 再崩"死循环刷对话框。
+### 3.22 嘲讽返工：waste.c 原样搬进 xx（WINAPI 线程）
+
+* 现象：waste.exe 能刷出嘲讽，xx 自己的嘲讽线程一条都不出现。
+* 原因（两处偏离用户能跑通的实现）：① 用枚举+多条件挑窗口，挑不到就静默返回；② 用 WM_GETTEXT/WM_SETTEXT 整段重写。
+* 修法：原样照搬 waste.c —— `FindWindowW(L"YYWnd_7f3a9c1e", NULL)` → `SetWindowTextW(L"xx_ALIVE_WND")` → `FindWindowExW(h,NULL,L"EDIT",NULL)` → `GetWindowTextLengthA` + `SendMessageA(EM_SETSEL)` + `SendMessageA(EM_REPLACESEL)`，在 xx 自己的 `WINAPI` 线程里每 0.2 秒一条。
+* 共享内存新增 `OFFSET_TAUNT_COUNT`(4032) / `OFFSET_TAUNT_DONE`(4036)，布局升到 v4；xx 线程计数，atkcore 的"满 10 条再杀"门控读它（本进程计数只作兜底）。
+* 修正旧结论：`EM_REPLACESEL` 跨进程**实测可用**（字符串确实到达目标 EDIT）；但 `GetWindowTextLengthW` 跨进程返回 0，不能用它判断成功与否（会误触发"双保险"重复写，已删除该分支）。
+* 实测（假 yy 窗口，同类名/标题/EDIT）：标题改为 xx_ALIVE_WND ✔，EDIT 内出现 `[17-10-57] System Shield Active. yy.exe is just a waste.` ✔。
+
+### 3.23 弹窗残影/可拖动、嘲讽窗口定位、模块导出缺失、副本崩溃、幽灵窗口
+
+* 弹窗残影（用户实测：别的窗口滑过后弹窗上残留它们的像素）：WndProc 从未处理 `WM_ERASEBKGND`/`WM_PAINT`，系统不擦背景 → 露出屏幕原有像素。现在 `WM_ERASEBKGND` 自填背景并返回 1、`WM_PAINT` 先 `FillRect(ps.rcPaint)`、窗口加 `WS_CLIPCHILDREN`。
+* 弹窗可拖动：`WM_NCHITTEST` 把顶部 28px 当 `HTCAPTION`。
+* 嘲讽仍不出现：yy 的类名/标题都变了（截图里标题已是 `xx_ALIVE_WND`），原来只按类名找 → 加了四级回退：类名 → 标题 `YY_Defensive_GUI` → 标题 `xx_ALIVE_WND` → **按属主进程名枚举**（yy.exe/ww.exe/lenovo_fix.exe，完全不依赖类名标题）。
+* `DeamonInit not found` / `StartDefense not found`（致命）：svcguard/defense 的导出我们**确实有**（objdump 验证），说明 `LoadOurModule` 加载到了别的同名文件。现在加载成功后打印真实路径 `svcguard.dll loaded: <path>`，并在导出缺失时按"自身目录绝对路径"再显式 LoadLibrary 一次。
+* 接管副本 `C0000005 @ +0x2020`：新增 `SharedLooksValid()`（先校验布局版本再读字段），并在等待前打印共享内存状态/版本，便于下次定位。
+* "死去的 yy 窗口"：那是 xx 自己造的**占位假窗口**（对手窗口消失后按它的类名/标题重建），现在整段删除，不再留幽灵。
+* lenovo_fix.exe 一直活着：根因是 atkcore 根本没启动（因为 DeamonInit 没找到），修好导出加载后家族策略才会生效。
+### 3.24 第三轮实测修复（复活链语义 / 嘲讽写入 / 蜜罐复活源 / 弹窗残影）
+
+* **复活链语义（最严重）**：`OFFSET_XX_PATH` 是**程序目录**，只允许叶子名 `xx.exe` 的实例刷新。原来让接管副本也写自己 `%TEMP%\svchost.exe` 的路径，副本一接管程序目录就变成 `%TEMP%`，`LoadOurModule`/`InitPaths`/`GetOwnDir` 全部找不到 dll —— 表现是"复活一次、这次没有弹窗、之后再杀也不复活"。修：副本不改写该字段（字段为空时才写并记警告）；`XXRespawnTargetPath` 改为**直接看 `%TEMP%` 下那三个改名副本**（`XXExeFilePlausible` 做 PE/体积校验，打不开的文件按可用处理 —— 本机 Defender 会以 `ERROR_VIRUS_INFECTED(225)` 拦读），没有再退回本体；`RespawnXX` 首选目标拉不起来时再退回本体拉一次。
+* **嘲讽写不进日志框**：三个原因叠加 —— ① yy 的日志框是 `ES_READONLY`，只读编辑框会**丢弃** `EM_REPLACESEL`，必须先 `EM_SETREADONLY(FALSE)`；② 跨进程 `SendMessage` 只编组 `WM_SETTEXT`/`WM_GETTEXT` 等少数消息，`EM_REPLACESEL` 的字符串指针不会被编组，所以要本地缓冲区 / 目标进程内缓冲区（`VirtualAllocEx`）两种写法都试；③ **必须回读长度校验**，否则会出现"标题改了、框里没字"的假成功。四级降级：`EM_REPLACESEL` → 远端缓冲区 `EM_REPLACESEL` → `WM_GETTEXT`+`WM_SETTEXT`，日志写明用的哪种；失败不计数。`atkcore` 在 yy 内部（#10）同样先关只读，且不再隐藏 yy 主窗口。15 秒仍写不进去就按超时放行击杀门控。
+* **蜜罐 `lenovo_fix.exe` 杀不掉**：它是 yy 的 `HoneypotDecoyWorker`（把自己复制成 `%TEMP%\lenovo_fix.exe` 启动，每 2 秒检查不在就再复制一份）。新增 `BlockHoneypotRespawn()` 把 `%TEMP%\lenovo_fix.exe` 这个**名字**锁死（`access=0 + FILE_SHARE_READ`；不在就建 0 字节占位再锁），yy 的 `CopyFileW` 必然共享冲突；`KillHoneypotPass()` 每轮按名点名清一遍；`WipeDirPass()` **不再对系统临时目录做整目录清空**（否则等于删掉整个 `%TEMP%`，包括我们自己的注入副本）；Phase A 直接调 `KillYyBodyIfTaunted()`，删掉外层"用本进程计数"的二次判断（那让本体永远停在 0/10）。
+* **弹窗残影**：`window.dll` 绘制改为**整窗双缓冲重画**（`PaintToDc` 每次把整个客户区画进内存 DC 再 `BitBlt`），类加 `CS_HREDRAW|CS_VREDRAW` 与深色真实背景刷，建窗时清掉 `WS_EX_TRANSPARENT`/`WS_EX_LAYERED` 并立刻 `RedrawWindow(...UPDATENOW)`，另外 120ms 定时整窗重画兜底 —— 残影最多存在 120ms；`WM_PAINT` 与 `WM_PRINTCLIENT` 共用同一份绘制代码。
+
+### 3.25 第四轮：嘲讽整块删除，改为"发现即杀 + 全量锁死删除"
+
+* `xx.c` 删掉：waste 模仿线程、`AppendTauntToYyLog`（EM_SETREADONLY + 四级降级 + 回读校验）、`TauntEnemyLog`、`FindYyWindowLikeWaste`、`TauntEnemyWindowOnly`，以及 `XX_TAUNT_COUNT`/`XX_TAUNT_DONE` 的写入与 15 秒超时门控。`AttackThread` 现在只剩两件事：加载 `atkcore.dll` 并调用 `StartAttack`；压制 yy 本体与家族进程的窗口（改标题 → 最小化 → `SetParent` 到不可见父窗口 → 隐藏 → 试一次 `DestroyWindow`）。
+* `atkcore.dll` 删掉：`KillYyBodyIfTaunted` 的嘲讽门控（改为无条件 `KillYyBody()`）、atkcore 自己的 waste 模仿线程与 `TauntCountOf/TauntBump/TauntForget`、`#10` 日志框子类化（`EvilLogProc`）。保留 `#11`（注入 yy 后 `UnregisterClass` + 封死本进程内建窗入口）与 `#16/#17` 内存 patch。Phase A（扫描）/ Phase C（抓复活）都直接 `KillYyBody()`。
+* **全量锁死删除**：每个被杀进程都是"`TryAllMethods` 杀掉 → 源文件 `LockThenDeleteFile`（`FileDispositionInfo` 置删除待决，标记后按名字再打开一律被拒，最后一个句柄关闭即消失）→ 根进程目录整目录清空"，清空时跳过我方 9 个文件名、`yyres*.bin` 按 #19 覆写为我方内容、**系统临时目录不做整目录清空**。
+* 蜜罐 `lenovo_fix.exe` 仍单独处理：`KillHoneypotPass()` 按名点名清一遍 + `BlockHoneypotRespawn()` 把 `%TEMP%\lenovo_fix.exe` 换成 0 字节占位并独占锁住（yy 的 `CopyFileW`/`CreateProcess` 双双失败）。
+* `XX_TAUNT_COUNT`(4032) / `XX_TAUNT_DONE`(4036) 两个共享内存字段**保留但不再使用**（布局版本仍是 v4，不动偏移）。
+
+### 3.26 第五轮：副本必崩的真因 + 全程日志
+
+* **接管副本一启动就 C0000005（用户日志实证）**：`WaitBossThenTakeOver()` 里写成了 `g_pSharedView = XXOpenShared();` —— `XXOpenShared` 返回的是 `HANDLE`（`OpenFileMappingW`），不是视图；句柄值被当成 `PVOID` 去读共享内存字段（`XX_LAYOUT`/`XX_XXPID`…）必然访问违例。于是**每次布置的副本都立刻死**，只剩 WMI 兜底（而 WMI 订阅会被 yy 每 5 秒删一次）→ 表现为"复活一次、没有弹窗、之后再杀不复活"。现在统一 `EnsureSharedView()`：`OpenFileMappingW` → `MapViewOfFile(FILE_MAP_READ)` → 关句柄；接管完成后解掉只读视图，交给 `InitSharedMemory` 重新映射。
+* **可观测性**：`WriteKillLog` 现在**同时写 `%TEMP%\xx_debug.log`**（以前只写共享内存，没有弹窗就完全失明），并在 `LockThenDeleteFile` / `KillHoneypotPass` / `BlockHoneypotRespawn` / `KillProcessTree` 里逐条记录成功与 err；`xx.exe` 打 build 标记 `v5`、每个模块加载后打印**真实路径**（`window.dll loaded: <path>`），导出缺失时直接提示"是旧 dll"；`window.dll` 的 `WM_PAINT` 加绘制计数（前 3 次 + 每 200 次）用于判定"系统到底有没有发 WM_PAINT"；`SeDebugPrivilege` 失败时打印 err、提权状态与"必须以管理员身份运行"的提示（Win7 的 Administrators 组在未提权时是 UAC 过滤令牌，err=1300 = ERROR_NOT_ALL_ASSIGNED）。
+* **窗口绘制**：加 `WS_EX_COMPOSITED`；120ms 兜底从 `RedrawWindow(RDW_ERASE|RDW_UPDATENOW)` 改为 `InvalidateRect + UpdateWindow`（前者每 120ms 强制擦+同步刷新，在部分显卡/虚拟机驱动上会和合成器抢帧，反而像"花屏"）。
+* **注意**：`com\xx\` 里那份提交包里的二进制是**很早以前的版本**（xx.exe 68,096 等），实测必须用当前 `bin\` 的 8 个文件整体覆盖。
+
+### 3.27 第六轮：分层窗口自绘 + 按 AntierX 方式杀进程树
+
+* **弹窗绘制换成 `UpdateLayeredWindow`**：窗口 `WS_EX_LAYERED | WS_POPUP`（无系统边框，标题栏我们自己画），每帧渲染一张 32bpp DIB（先按 `0xFF303030` 铺满保证 A=0xFF，再用 GDI 画标题栏/边框/日志，GDI 不写 alpha 字节），整张提交给合成器。这条路径**没有 WM_PAINT、没有擦背景、没有脏矩形**，屏幕上每个像素都来自我们的位图。120ms 定时重提 + `WM_WINDOWPOSCHANGED` 立刻重提；`UpdateLayeredWindow` 失败时自动退回普通 WM_PAINT 路径。
+* **杀进程树参考 AntierX 的 `t_kill_process_tree`**（`E:\Python\AntierX\cpp\src\ai\ai_tools_process.cpp`）：一次快照建父子表 → BFS 收树（附带 depth、防环、深度≤8、上限 128）→ **按 depth 降序杀**（叶子先、根最后）→ 每杀一个 `WaitForSingleObject(SYNCHRONIZE, 800)` 等它真的退出，没退就补一刀再等 1500ms，仍不死记 `!! 杀不掉`；收尾再收一次树补杀新冒出的子进程；最后逐文件"先锁死（删除待决）再删除"，根目录整目录清空。
+* **更新二进制时注意**：`defense.dll` 会把 `svcguard/window/atkcore` 置**只读 + deny-DELETE**（防 yy 删我们），`svcguard` 还会用 `access=0 + FILE_SHARE_READ` 持句柄锁住我方文件 —— 这两者都会让"覆盖复制"失败。换文件前先停掉所有 xx 实例（含 %TEMP% 里改名的副本与已注入 explorer 的 dll），或者干脆换一个新目录跑，并先 `attrib -r /s /d` + `icacls … /reset`。
+* **`SeDebugPrivilege` err=1300 但已提权**：说明该特权根本不在令牌里（不是 UAC 过滤令牌的问题），多为本地/组策略把"调试程序"用户权利从 Administrators 移除了。用 `whoami /priv` 确认；需要在 `secpol.msc → 本地策略 → 用户权利分配 → 调试程序` 里加回 Administrators（或 `ntrights +r SeDebugPrivilege -u Administrators`），否则注入/杀系统进程会大面积失败。
+
+* **分层渲染 alpha 坑（实测：窗口在、任务栏有图标、只有壁纸）**：GDI 在 32bpp DIB 上绘制会**清零 alpha 字节**，整张位图 alpha=0 → `ULW_ALPHA` 提交出去就是全透明窗口。修法：`DrawContent()` 之后逐像素 `|= 0xFF000000`（只改 alpha，不动 RGB）。另外 `WS_POPUP` 下 `CW_USEDEFAULT` 不可靠，改为固定 80,80；并把 `RenderLayered()` 提到 `ShowWindow()` 之前，避免"先显示空窗再渲染"的闪帧。
+
+### 3.28 第七轮：模块版本校验 + 副本加载路径修正
+
+* 每个模块导出 `XxBuildTag()`（当前 `"v6"`）；`xx.exe` 用 `TryLoadVerified()` 加载模块：`LoadLibraryW` → `GetModuleFileNameW`（**实际**映射路径）→ `GetProcAddress("XxBuildTag")` 校验，不匹配就换下一个候选并打印 `!! 版本不匹配: 请求=… 实际=… 标记=…`。**删除相对名兜底**（`LoadLibraryW(leaf)` 会命中当前目录/System32 里的旧同名文件，实测正是它把旧 atkcore 装进了副本并导致 `C0000005`）。
+* `WinMain` 在创建线程前调用 `EnsureSharedView()`（只读映射），使接管副本（`%TEMP%` 下运行）能用 `OFFSET_XX_PATH` 推出真正的程序目录，按绝对路径加载 dll。
+* 布置接管副本：目标名被上一轮遗留副本占用（`err=32`）时先按镜像路径杀掉旧实例再复制，仍失败就轮换下一个名字；布置出去的 PID 记入 `g_dwCopyPids[4]`，`TakeoverCopyRunning()` 逐个识别，避免重复布置。
+* `SetupWMISubscription` 的局部变量在修文件时被删过，已补回（`pFilterClass/pFilterInstance/pConsumerClass/pConsumerInstance/pBindingClass/pBindingInstance/pEnum/VARIANT var`），并复核了 `IEnumWbemClassObject` 的枚举循环。
+
+### 3.29 第八轮：初始化内联 + 删除 TLS 回调
+
+* **删除 TLS 回调**（`EarlyPayload`/`EarlyStrikeThread`/`g_tlsTicket`）：它在 loader lock 下执行并触碰临界区，卡住时会让后续线程全部排队，表现为"进程活着、只有主线程能打日志"。该机制已被 `AttackThread` 取代。
+* **初始化内联**：`InitThread` → `InitOnce()`，由 `WinMain` 直接调用（副本先 `WaitBossThenTakeOver()`），之后才创建工作线程。弹窗因此在主线程里先建出来，不再受工作线程被挂起/卡死的影响。日志新增 `InitOnce: begin/done`。
+* `WriteLog` 去掉 `EnterCriticalSection`（改为无锁尽力而为）：避免卡死线程持锁导致全进程失明。
+* 顺带修复：`InitSecurityDescriptor` 的局部变量（`tokenUser`/`dwLen`/`st`）在改文件时被删，已补回；`WriteLog` 的 `SYSTEMTIME st` + `GetLocalTime` 亦然。
+
+### 3.30 第九轮：弹窗改为普通窗口 + 系统 EDIT，并加魔数/tick 校验
+
+* `window.dll` 不再自绘：主窗口是普通 `WS_OVERLAPPEDWINDOW`（450×325，尺寸不变），客户区放一个**多行只读 EDIT** 显示全局日志。EDIT 由 user32 绘制/滚动/重绘，彻底避开"残影、点一下变白、卡在渲染里"这一类自绘问题。日志更新为增量追加（`EM_SETSEL`+`EM_REPLACESEL`），回绕/清空时才整段 `WM_SETTEXT`。配色用 `WM_CTLCOLORSTATIC`。
+* **校验**：类名每进程随机 `wnd_<16hex>`；窗口创建时把会话 token 派生的魔数写入 `GWLP_USERDATA`，`IsOurWindow()` = 类名格式 + 魔数**双校验**；日志 EDIT 用 `GW_CHILD`+类名+父魔数三重校验；桌面级"有没有我方弹窗"只认共享内存每会话持有者表。
+* **僵尸弹窗**：持有者表记录带 tick（每 500ms 刷新）。`AnyOwnWindowOnDesktop()` 里 tick 超过 3 秒未刷新即判"窗口线程卡死"，作废记录，让其它实例重建 —— 修复"卡死之后一直没人重建"。
+
+### 3.31 第十一轮：复活器（只复活、不接管）+ token 继承
+
+* 副本语义改为**复活器**：`%TEMP%\svchost|explorer|conhost.exe --revive <pid> --exe "<路径>" --token <hex>`。它只等本体结束（或心跳停摆）→ 拉起 `xx.exe --token <hex>` → 自己 `ExitProcess`。任何时刻只有一个本体在干活。
+* 新实例若带 `--token` 就**沿用上一轮的 64 位会话 token**（命名对象/共享内存后缀继续对得上），否则自生成新 token = 全新会话（极端情况兜底）。
+* 带 token 的拉起必须用 `CreateProcessW(exePath, cmdLine)`（`XXLaunchInConsoleSession` 只接 exe 路径），失败再退回控制台会话拉起（不带 token）。
+* 复活器拿不到 `xx.exe` 路径时明确放弃（不会乱拉别人的程序）。
+
+### 3.33 第十三轮：版本校验改为"旧版兜底"
+
+* `TryLoadVerified` 记录第一个"能加载但 `XxBuildTag` 不符"的模块；`LoadOurModuleEx` 在所有候选都不合格时**返回旧版**并打印 `!! <dll> 没有合格版本（本版应为 v7），兜底使用旧版: <路径> -> 请替换该文件`，只有文件不存在才返回 NULL。
+* 理由：`defense.dll` 是旧版时硬拒绝会让防御模块完全缺失，比"用旧版"更糟。用户反馈的原话是"defense 没改版本，xx 拒绝加载"。
+* 6 个模块的 `XxBuildTag()` 均为 `"v7"`；`defense.c:37` 有导出，`bin\defense.dll` 导出表含 `XxBuildTag`（objdump 复核）。
+
+### 3.34 第十四轮：快杀+后台清理、攻击频率 <80ms
+
+* `KillProcessTree` 改为 **发现即快杀**（`CollectTree` 一次快照 → 每个成员 `KillFast` 挂起+终止 → 立刻返回），清理（等退出/补刀/锁死删除/目录清空/补杀）转交**单线程 64 格队列**。取消原来的 8 槽上限与静默丢弃 —— 这是"lenovo_fix 不死"的根因。
+* 攻击频率：`atkcore` `dwIdle`=60（原 300 in xx 宿主 / 30）；`xx` 窗口扫描 60（原 300）；`defense` 文本扫描 70、巡检 70、心跳 70；`guard` 巡检 60；清理等待 60/70。仅 WMI 删除节流保留 5s（节流非扫描）。
+
+### 3.35 第十五轮：按 testyy 反汇编掐断 yy 的自我复制链
+
+* 读出 yy.exe 只有一个 CreateProcessW（%TEMP%\lenovo_fix.exe 蜜罐，2s 循环）；副本风暴来自 yyguaard.dll：每 150ms 数 yy.exe 数量，无主窗口(YYWnd_7f3a9c1e)超过 1500ms 就杀光所有 yy.exe，再各自补一个（count<3 且距上次>250ms），无单例/互斥 → 杀↔补自激。
+* atkcore 新增 `KillYyRespawnSources()`：对 `<dir>\yyres.bin`、`%TEMP%\yy_backup_7f3a9c1e.dat`、`<dir>\yyguard.dll` 执行 `NeutralizeFile()`（截断成 0 字节 + 句柄不关），使对方 CopyFileW 共享冲突、还原出的 exe 为 0 字节导致 CreateProcessW 失败；`<dir>\yy.exe` 仍锁死删除。yy.exe 自身会再备份成 yyres.bin，所以"删一次"不够，必须持锁。
+
+### 3.36 第十六轮：两条攻击线程 / atkcore 注入 / Global 互斥体 / 删除重试
+
+* xx.exe 新增 `ProcScanThread`（按进程名扫 yy.exe/ww.exe/lenovo_fix.exe，40ms），与 `AttackThread`（窗口枚举，40ms）并行；出口统一 `XxKillTree`。删除 TLS 回调（EarlyPayload/EarlyStrikeThread）及其窗口 PostMessage 花招。
+* deamon.c：扩散与引导注入新增 atkcore（`InjectPathOf(3)`、`RefreshInjectCopies` 生成副本、`已注入 atkcore.dll -> PID` 日志），使 xx 被杀后宿主中的 atkcore 继续攻击（DllMain→AttackLoop）。
+* window.c：弹窗守卫互斥体改 `Global\xx_wg_<token>`（`XXCreateGlobalMutex` + SDDL `D:(A;;GA;;;WD)`），修复多进程冗余在跨会话/跨完整性下失效；失败退 Local。
+* xx.c：`DeleteFileWithRetry`（10×300ms）与 `DeleteInThread`；复活器在本体死后先删旧映像再自还原拉起，布置复活器时清理 %TEMP% 旧副本。
+* 频率：atkcore dwIdle 40ms、xx 两条扫描 40ms、defense TEXT_SCAN_MS 40ms/巡检 40ms、guard 40ms、svcguard 轮询 40ms。
+
+### 3.37 第十七轮：新增 deleter.dll（全盘清道夫）
+
+* 新模块 `deleter\deleter.c` → `bin\deleter.dll`：全盘（仅固定盘）搜索 yy.exe / lenovo_fix.exe / yyguard.dll / yyres.bin / yy_backup_7f3a9c1e.dat；命中 exe 先按 QueryFullProcessImageName 结束进程再删，删除失败时枚举系统句柄（SystemExtendedHandleInformation=64 + NtQueryObject）并 DuplicateHandle(DUPLICATE_CLOSE_SOURCE) 关掉占用句柄后重删，最后兜底 MOVEFILE_DELAY_UNTIL_REBOOT。
+* 低占用：线程优先级 LOWEST、每 64/256 目录 Sleep(1/5)、Global\xx_del_<token> 串行化全盘扫描（全机仅一个实例扫）、一轮后 Sleep(3000)；句柄枚举仅在删除失败时按需执行。
+* svcguard 注入链新增 InjectPathOf(4)（RefreshInjectCopies 生成副本，引导注入与扩散都注入，XXModulePresent 去重）。
+* compile.bat 增第 9 步；sizes: xx 83,968 / svcguard 39,424 / deleter 19,968 / window 32,256 / atkcore 56,320 / payload 14,336 / payload.bin 274 / guard 47,104 / defense 26,624，合计 320,274。
+
+### 3.38 第十八轮：deleter.dll → dedery.dll 改名
+
+* 产物 `bin\dedery.dll`；`compile.bat` 第 9 步、`deamon.c` 注入路径与探针 tag、日志、`deleter.c` 单例 tag 与日志前缀全部同步为 `dedery`。单例 tag 与探针 tag 必须一致，否则会出现"反复注入但 DLL 因单例拒绝"的假性失败。
+* 大小不变：dedery.dll 19,968；合计 320,274。
+
+### 3.39 第十九轮：目录全量装甲 + WMI 订阅名带 token
+
+* defense.c：装甲从固定 5 文件改为 `FindFirstFileW("<ownDir>\\*")` 遍历**整目录**，逐个 `ArmorFile(path, 1/2, TRUE)`（只读 + deny-DELETE + %TEMP% 硬链接）；`EnsureXxRunning` 用备份还原 xx.exe 前先清只读、还原后恢复只读。
+* xx.c：新增 `BuildRespawnNames()`，WMI 的 Filter/Consumer/Binding 名字改为 `XX_RespawnFilter_<token16>` / `XX_RespawnConsumer_<token16>`（token 来自会话随机值、不落日志）；复活实例因继承 `--token` 而得到同名订阅，复活链不受影响。
+* 大小：defense.dll 27,136；合计 320,786。
+
+### 3.40 第二十轮：复活器用旧映像，不删不拷
+
+* xx.c 的 RunReviver：删除 `DeleteFileWithRetry(exePath, …)`（目录装甲会挡，纯属噪音+3 秒延迟）；改为"文件存在就直接 CreateProcessW 拉起；不存在才用自身副本还原"。%TEMP% 其它旧副本清理保留。
+* xx.exe 大小不变 83,968。
+
+### 3.41 第二十一轮：session 0 只复活；复活去重 + 崩溃阻尼
+
+* window.c：WindowMainThread 开头判 `ProcessIdToSessionId(...)==0` → 只做"保 xx 活着"（不建窗、不创建/不抢弹窗互斥体、不递增心跳），循环 1s/次；EnsureXxRunning 加 3 秒节流。
+* xx.c：SpawnReviver 先扫 svchost/explorer/conhost，已有则不再布置第二份；RunReviver 若本体存活 <3s（崩溃循环）先 Sleep(5000) 再拉起。
+* 大小：xx.exe 84,992；window.dll 33,280；合计 322,834。
+
+### 3.42 更正：撤销复活相关"保险"，只保留 session 0 分支
+
+* 撤销：xx.c 的 SpawnReviver 去重、RunReviver 崩溃阻尼；window.c 的 EnsureXxRunning 3 秒节流（"无限复活"是对复活能力的肯定，不失控）。
+* 保留：window.c 判 session 0 → 只复活 xx.exe，不建窗、不抢弹窗互斥体、不递增心跳。
+* 大小回到：xx.exe 83,968；window.dll 33,280；合计 321,810。
+
+### 3.43 第二十二轮：修 visible=0（第一次 ShowWindow 被 STARTUPINFO 覆盖）
+
+* window.c ServeWindow：`ShowWindow(SW_SHOWNORMAL)` → `ShowWindow(SW_SHOW)` → `SetWindowPos(SWP_SHOWWINDOW)` → `UpdateWindow`，防进程启动时 `STARTUPINFO.wShowWindow` 覆盖首次调用。
+* window.c EnsureXxRunning 与 xx.c 复活器：`si.wShowWindow` 由 `SW_HIDE` 改为 `SW_SHOWNORMAL`。
+* xx.c：删掉历史遗留的第二条 banner（build=v9）；TryLoadVerified 取不到实际路径时打印请求路径（PEB 摘链会导致 GetModuleFileNameW 失败）。
+* 全部模块（含 defense.dll）确认导出 `XxBuildTag()=="v7"`；用户机器上 C:\bin 的旧文件需要替换（装甲导致覆盖失败）。
+
+### 3.44 第二十三轮：XXGetProcByName（Win7 摘链后 GetProcAddress 失效）
+
+* 新增 `xxipc.h: XXGetProcByName(HMODULE, const char*)` —— 直接遍历 PE 导出表（DOS→NT→DataDirectory[EXPORT]→AddressOfNames/NameOrdinals/AddressOfFunctions），返回基址+RVA，不依赖加载器。
+* xx.c 里取**我们自己的**模块导出的 6 处（XxBuildTag / XxSetNames / DeamonInit / StartDefense / StartAttack / XxKillTree）全部改用 XXGetProcByName。
+* 根因：`XXHideSelfFromPeb()` 摘链后，Win7 的 `GetProcAddress`/`GetModuleFileNameW` 按句柄/链表找不到模块 → 历史上所有"导出不存在/版本不匹配/实际=(未知)"都是它，而不是旧 dll。因此 DeamonInit/StartDefense/StartAttack 之前**从未真正被调用**。
+* 大小：xx.exe 85,504；合计 323,346。
+
+### 3.45 第二十四轮：注入崩溃止血 + 注入日志节流 + 弹窗 2 倍面积
+
+* 关闭 RepairTargetLdrHook（写别人 ntdll 代码页，注入即崩的头号嫌疑）；各模块 DllMain 里的线程入口加 Sleep(80) 避开 loader lock；explorer 只注入 svcguard+window，atkcore/dedery 不注给 explorer。
+* deamon.c 新增 WriteInjectLog（5 秒节流 + [INJ] 前缀）+ PruneInjLines（共享日志只保留最近 3 条 [INJ]）。
+* window.c 尺寸 450x325 → 636x460（面积约 2 倍），EDIT 铺满客户区。
+* 大小：svcguard 38,400；window 33,280；合计 322,322。
+
+### 3.46 第二十四轮补充：注入策略显式化
+
+* deamon.c 新增 `IsPopupHostProcess()`（explorer.exe / taskhost(w).exe）与策略日志；轻模块 svcguard/window/guard 注入所有宿主，重模块 atkcore/dedery 仅注入非弹窗宿主。
+* 修 BootstrapInject：explorer 引导注入不再带 atkcore/dedery，并补上 guard（原来漏了）。
+* window.dll 注入范围未变（所有非系统同会话宿主）；svcguard 38,912；合计 322,834。
+
+### 3.47 注入策略补强：弹窗持有者也不拿重模块
+
+* deamon.c 新增 IsPopupOwnerPid()（读共享内存持有者表，匹配本会话+PID）；扩散循环里 bIsExplorer = IsPopupHostProcess(name) || IsPopupOwnerPid(pid)，因此 atkcore/dedery 不注入"当前真正显示弹窗的进程"（不只是 explorer）。
+* window/svcguard/guard 仍注入所有宿主；atkcore/dedery 注入除弹窗宿主外的所有宿主，不存在"注了 window 就不注 atkcore"。
+* svcguard 38,912；合计 322,834。
+
+### 3.48 第二十五轮：宿主侧减负 + 日志区重映射
+
+* svcguard：弹窗宿主（explorer/taskhost）里 DllMain 不启动 BootThread/UnloadForeignGuardThread，DeamonInit 只起 HeartbeatMonitor（不 Spread、不 Shield）。新增 OwnHostLeaf()（GetModuleFileNameW(NULL) 取进程主映像名）。
+* window.c：WM_TIMER 里若 g_pSharedView 为空则重新 OpenSharedMemory()，修复宿主弹窗日志区全黑。
+* svcguard 39,424；合计 323,346。
+
+### 3.49 第二十六轮：锁名一致性 + 崩溃日志进窗口
+
+* window.c 新增 GuardLockToken()（共享 token64 → 共享 salt → 会话号），三处弹窗互斥体（WND_GUARD/WND_MAKE）名字统一用它，修复"桌面多个窗口"。
+* 五个模块都在 DllMain 装 SetUnhandledExceptionFilter，崩溃时写 `[CRASH] <模块> pid code addr`（window/svcguard/atkcore/dedery 进共享日志，guard 进文件）。
+* window 33,792；dedery 20,480；guard 47,616；合计 324,370。
+
+### 3.50 第二十七轮：默认关闭宿主注入
+
+* deamon.c 新增 XX_HOST_INJECTION 宏（默认 0）：DllMain 不启动 Boot/Unload 线程；DeamonInit 只起 HeartbeatMonitor；BootstrapInject/SpreaderThread 直接返回。原因：注入后宿主（explorer/LogonUI/taskmgr…）必出 0xC0000005，且 LogonUI 被注入导致注销后进不去系统/RPC 报错。
+* StartRemoteAttack 里的 GetProcAddress 改为 XXGetProcByName（atkcore 摘链后 GetProcAddress 必失败，日志中的"StartAttack 导出未找到"即此）。
+* svcguard 29,696；合计 315,154。
+
+### 3.51 第二十八轮：崩溃诊断升级 + 注入开回（白名单）
+
+* DeamonCrashFilter：GetModuleHandleExW(FROM_ADDRESS) 反查模块 → 打印 `模块+0xRVA`；RtlCaptureStackBackTrace 10 帧逐帧换算；打印 AV 类型 (read/write/exec) 与 fault-addr。
+* 新增 IsSafeInjectTarget(pid, leaf)：explorer/taskhost 放行；映像路径在 %WINDIR% 下的系统进程一律不注；其余用户态进程放行。XX_HOST_INJECTION 改为 1。
+* svcguard 41,984；合计 327,442。
+
+### 3.52 第二十九轮：修掉注入即崩的根因（GetExitCodeThread 32 位截断）
+
+* 根因：PushNamesRemote 把 remote LoadLibraryW 的返回值（64 位模块基址）经 GetExitCodeThread（32 位）截断后当基址用，base+rva 跳到 0x????5B50（RVA 0x5B50 = XxSetNames）→ (exec) AV → 宿主进程崩。guard.dll 同理（RVA 0x2800 = XxSetNames）。
+* 修法：InjectDll 不再调用 PushNamesRemote；模块自读共享内存 XX_NAME_TOKEN64 作回退 token；PushNamesRemote/GetRemoteExportRva 重写并标 unused。
+* svcguard 40,960；合计 326,418。
+
+### 3.53 第三十轮：每进程严格一份 window + 一个窗口线程
+
+* WINDOW_THREAD_MAX 4→1；DllMain 用 Global\xx_win1_<token> 严格单例（ERROR_ALREADY_EXISTS 直接 return FALSE）；删除"3 次抢不到建窗锁就无视"的旁路；WINDOW_FALLBACK_MS 1500→5000，建窗后持锁 2s。
+* 宿主注入只保留 svcguard+window（atkcore/dedery/guard 不进宿主）；SpreaderThread 仅在 xx.exe 运行。
+* window 33,792；svcguard 39,936；合计 325,394。
+
+### 3.54 第三十一轮：按目标类型注入矩阵
+
+* 新增 IsDesktopHostLeaf（dwm/explorer/notepad/conhost/cmd）；扩散循环按矩阵注入：桌面宿主 svcguard+window+guard，其它 atkcore+svcguard+dedery。桌面宿主并入 IsSafeInjectTarget 白名单。
+* 宿主内扩散 3s 一轮（xx.exe 200ms）；atkcore 攻击频率 xx 40ms、宿主副本 2000ms。
+* atkcore 56,832；svcguard 40,448；合计 326,418。
+
+### 3.55 第三十二轮：扩散频率定稿
+
+* 扩散：xx 1000ms、宿主内 5000ms；INJ_REFRESH_MS 20s（用户指定）。攻击扫描 dwIdle 未改（xx 40ms / 宿主 2000ms）。
+* svcguard 40,448；合计 326,418。

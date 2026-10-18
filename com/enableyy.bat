@@ -1,1 +1,0 @@
-echo "" > C:\nohood.flag

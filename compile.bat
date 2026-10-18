@@ -13,7 +13,7 @@ set CFLAGS=-s -O2 -Wall -static -mwindows -I. -finput-charset=UTF-8
 set DLLFLAGS=-s -O2 -Wall -static -shared -I. -finput-charset=UTF-8
 
 echo.
-echo [1/8] Compiling xx.exe ...
+echo [1/9] Compiling xx.exe ...
 gcc %CFLAGS% -o "%OUTDIR%\xx.exe" xx\xx.c ^
     -lole32 -loleaut32 -lwbemuuid -ladvapi32 -lpsapi -lshell32
 if errorlevel 1 (
@@ -23,7 +23,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [2/8] Compiling svcguard.dll ...
+echo [2/9] Compiling svcguard.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\svcguard.dll" deamon\deamon.c ^
     -ladvapi32 -lpsapi -lshell32
 if errorlevel 1 (
@@ -33,7 +33,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [3/8] Compiling window.dll ...
+echo [3/9] Compiling window.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\window.dll" window\window.c ^
     -lgdi32 -luser32 -ladvapi32
 if errorlevel 1 (
@@ -43,7 +43,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [4/8] Compiling atkcore.dll ...
+echo [4/9] Compiling atkcore.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\atkcore.dll" killtools\killtools.c ^
     -luser32 -lkernel32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid
 if errorlevel 1 (
@@ -53,7 +53,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [5/8] Compiling payload.dll ...
+echo [5/9] Compiling payload.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\payload.dll" killer\killer.c ^
     -luser32 -lkernel32
 if errorlevel 1 (
@@ -63,7 +63,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [6/8] Compiling guard.dll ...
+echo [6/9] Compiling guard.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\guard.dll" guard\guard.c ^
     -ladvapi32
 if errorlevel 1 (
@@ -73,7 +73,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [7/8] Assembling payload.bin ...
+echo [7/9] Assembling payload.bin ...
 nasm -f bin -o "%OUTDIR%\payload.bin" killer\killer.asm
 if errorlevel 1 (
     echo ERROR: Failed to assemble payload.bin
@@ -82,7 +82,7 @@ if errorlevel 1 (
 echo Done.
 
 echo.
-echo [8/8] Compiling defense.dll ...
+echo [8/9] Compiling defense.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\defense.dll" defense\defense.c ^
     -luser32 -ladvapi32 -lpsapi -lshell32 -Wl,--export-all-symbols
 if errorlevel 1 (
@@ -95,6 +95,15 @@ echo.
 echo ========================================
 echo   Build successful!
 echo   Output: %OUTDIR%\
+echo.
+echo [9/9] Compiling dedery.dll ...
+gcc %DLLFLAGS% -o "%OUTDIR%\dedery.dll" deleter\deleter.c ^
+    -ladvapi32 -lpsapi -lshell32
+if errorlevel 1 (
+    echo ERROR: Failed to compile dedery.dll
+    goto :error
+)
+echo Done.
 echo ========================================
 goto :end
 
@@ -107,3 +116,4 @@ exit /b 1
 :end
 pause
 exit /b 0
+

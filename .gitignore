@@ -57,3 +57,10 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
+
+# ---------- 逆向分析产物 / 损坏残片（只保留源码与文档）----------
+/test/yy_reconstructed.exe
+/test/yyguard_fixed.exe
+/test/yyguard_fixed.dll
+/test/yyguard_reconstructed.dll
+/xx/xx.c.broken_tail
