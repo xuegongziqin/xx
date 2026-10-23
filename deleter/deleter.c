@@ -407,6 +407,218 @@ static void ScanAllDrives(void)
            (unsigned long long)dirs, (long)g_nDeleted, (long)g_nKilled);
 }
 
+/* ================== T0：句柄所有权扫描（第二个线程） ==================
+   对手会换名字、换版本，但**只要它还持有我方进程的句柄**就一定是敌人：
+   keeper/hunter 类逻辑必须 OpenProcess(xx) 才能杀我们。这条证据和名字、版本、
+   编译时间全都无关，是三层里最强的一层。
+   与全盘扫描**并行**跑（用户要求 dedery 两个线程），全机只允许一份实例动手。 */
+static HANDLE g_hT0Lock = NULL;
+
+/* 我方进程：映像名 xx.exe，或共享内存里记录的 xx PID */
+static BOOL T0IsOurPid(DWORD pid)
+{
+    WCHAR img[MAX_PATH] = L"";
+    DWORD cch = MAX_PATH;
+    HANDLE h;
+    const WCHAR *leaf;
+    static PVOID s_view = NULL;
+    static BOOL  s_viewTried = FALSE;
+
+    if (!pid || pid <= 4) return FALSE;
+
+    if (!s_viewTried) {
+        HANDLE hMap;
+        s_viewTried = TRUE;
+        hMap = XXOpenShared();
+        if (hMap) {
+            s_view = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE);
+            CloseHandle(hMap);
+            if (!s_view) s_view = NULL;
+        }
+    }
+    if (s_view && pid == (DWORD)XX_XXPID(s_view)) return TRUE;
+
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return FALSE;
+    if (!QueryFullProcessImageNameW(h, 0, img, &cch)) { CloseHandle(h); return FALSE; }
+    CloseHandle(h);
+    leaf = wcsrchr(img, L'\\');
+    leaf = leaf ? leaf + 1 : img;
+    return (_wcsicmp(leaf, L"xx.exe") == 0);
+}
+
+/* 系统目录下的进程：只记日志、不动手（杀了 explorer/csrss 是我们自己输） */
+static BOOL T0IsSystemImage(DWORD pid)
+{
+    WCHAR img[MAX_PATH] = L"", windir[MAX_PATH] = L"";
+    DWORD cch = MAX_PATH;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return TRUE;                       /* 开不了就当系统进程，别动 */
+    if (!QueryFullProcessImageNameW(h, 0, img, &cch)) { CloseHandle(h); return TRUE; }
+    CloseHandle(h);
+    if (!GetWindowsDirectoryW(windir, MAX_PATH) || !windir[0]) return TRUE;
+    return _wcsnicmp(img, windir, wcslen(windir)) == 0;
+}
+
+/* 用手持自身进程句柄的办法反查 ObjectTypeIndex（进程对象类型号与版本相关） */
+static USHORT T0ProcessTypeIndex(void)
+{
+    static USHORT s_idx = 0;
+    HANDLE hSelf;
+    NtQuerySystemInformation_t pQuery;
+    HMODULE hNtdll;
+    BYTE *buf;
+    ULONG size = 1 << 20, needed = 0;
+    LONG st;
+    ULONG_PTR i, n;
+    XX_HANDLE_INFO *info;
+
+    if (s_idx) return s_idx;
+    hSelf = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentProcessId());
+    if (!hSelf) return 0;
+    hNtdll = GetModuleHandleW(L"ntdll.dll");
+    pQuery = hNtdll ? (NtQuerySystemInformation_t)GetProcAddress(hNtdll, "NtQuerySystemInformation") : NULL;
+    if (!pQuery) { CloseHandle(hSelf); return 0; }
+
+    for (;;) {
+        buf = (BYTE *)malloc(size);
+        if (!buf) { CloseHandle(hSelf); return 0; }
+        st = pQuery(XX_SYSTEM_EXTENDED_HANDLE_INFORMATION, buf, size, &needed);
+        if (st == 0) break;
+        free(buf);
+        buf = NULL;
+        if ((ULONG)st != 0xC0000004UL && (ULONG)st != 0x80000005UL) { CloseHandle(hSelf); return 0; }
+        size = needed ? needed + (256 << 10) : size * 2;
+        if (size > (256u << 20)) { CloseHandle(hSelf); return 0; }
+    }
+
+    info = (XX_HANDLE_INFO *)buf;
+    n = info->NumberOfHandles;
+    for (i = 0; i < n; i++) {
+        XX_HANDLE_ENTRY *e = &info->Entries[i];
+        if ((DWORD)e->UniqueProcessId == GetCurrentProcessId() &&
+            e->HandleValue == (ULONG_PTR)hSelf) {
+            s_idx = e->ObjectTypeIndex;
+            break;
+        }
+    }
+    free(buf);
+    CloseHandle(hSelf);
+    return s_idx;
+}
+
+/* 扫一遍：谁持有我方进程句柄 */
+static void T0HandlePass(void)
+{
+    USHORT procIdx = T0ProcessTypeIndex();
+    NtQuerySystemInformation_t pQuery;
+    HMODULE hNtdll;
+    BYTE *buf;
+    ULONG size = 1 << 20, needed = 0;
+    LONG st;
+    ULONG_PTR i, n;
+    XX_HANDLE_INFO *info;
+    int hits = 0, checked = 0;
+
+    if (!procIdx) return;
+    hNtdll = GetModuleHandleW(L"ntdll.dll");
+    pQuery = hNtdll ? (NtQuerySystemInformation_t)GetProcAddress(hNtdll, "NtQuerySystemInformation") : NULL;
+    if (!pQuery) return;
+
+    for (;;) {
+        buf = (BYTE *)malloc(size);
+        if (!buf) return;
+        st = pQuery(XX_SYSTEM_EXTENDED_HANDLE_INFORMATION, buf, size, &needed);
+        if (st == 0) break;
+        free(buf);
+        buf = NULL;
+        if ((ULONG)st != 0xC0000004UL && (ULONG)st != 0x80000005UL) return;
+        size = needed ? needed + (256 << 10) : size * 2;
+        if (size > (256u << 20)) return;
+    }
+
+    info = (XX_HANDLE_INFO *)buf;
+    n = info->NumberOfHandles;
+    for (i = 0; i < n; i++) {
+        XX_HANDLE_ENTRY *e = &info->Entries[i];
+        DWORD owner, target;
+        HANDLE hOwner, hDup = NULL;
+
+        if (e->ObjectTypeIndex != procIdx) continue;
+        if (!e->UniqueProcessId || (DWORD)e->UniqueProcessId == GetCurrentProcessId()) continue;
+        owner = (DWORD)e->UniqueProcessId;
+        checked++;
+
+        /* 先只拿 DUP_HANDLE 打开属主（便宜），dup 出来再问它指向哪个 PID */
+        hOwner = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner);
+        if (!hOwner) continue;
+        if (!DuplicateHandle(hOwner, (HANDLE)e->HandleValue, GetCurrentProcess(), &hDup,
+                             PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0) || !hDup) {
+            CloseHandle(hOwner);
+            continue;
+        }
+        target = GetProcessId(hDup);
+        CloseHandle(hDup);
+
+        if (target && T0IsOurPid(target)) {
+            WCHAR img[MAX_PATH] = L"", *leaf;
+            DWORD cch = MAX_PATH;
+            hits++;
+            if (QueryFullProcessImageNameW(hOwner, 0, img, &cch)) {
+                leaf = wcsrchr(img, L'\\');
+                leaf = leaf ? leaf + 1 : img;
+            } else leaf = L"?";
+            DelLog(L"[T0] PID=%lu(%ls) 持有我方进程 PID=%lu 的句柄 access=0x%lX",
+                   owner, leaf, target, e->GrantedAccess);
+            if (T0IsSystemImage(owner)) {
+                DelLog(L"[T0] PID=%lu 是系统目录下的进程：只记录，不动手", owner);
+            } else {
+                HANDLE hK = OpenProcess(PROCESS_TERMINATE, FALSE, owner);
+                if (hK) {
+                    if (TerminateProcess(hK, 0))
+                        DelLog(L"[T0] 已结束 PID=%lu（持有我方进程句柄）", owner);
+                    else
+                        DelLog(L"[T0] 结束 PID=%lu 失败 err=%lu", owner, GetLastError());
+                    CloseHandle(hK);
+                } else {
+                    DelLog(L"[T0] 打不开 PID=%lu 的终止权限 err=%lu", owner, GetLastError());
+                }
+            }
+        }
+        CloseHandle(hOwner);
+    }
+    free(buf);
+    if (hits)
+        DelLog(L"[T0] 本轮句柄扫描：检查进程句柄 %d 个，命中 %d 个", checked, hits);
+}
+
+/* T0 线程：10 秒一轮；全机只允许一份实例动手（和全盘扫描用不同的锁） */
+static DWORD WINAPI T0ScanThread(LPVOID lp)
+{
+    Sleep(200);   /* 让 DllMain 先返回，别踩 loader lock */
+    UNREFERENCED_PARAMETER(lp);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    DelLog(L"T0 句柄扫描线程启动（10s 一轮，独立于全盘扫描）");
+
+    for (;;) {
+        DWORD w;
+        if (g_bExit) break;
+        if (!g_hT0Lock) {
+            WCHAR nm[128];
+            XXNamedObject(nm, _countof(nm), TRUE, L"t0", g_dwNameToken, 0);
+            g_hT0Lock = CreateMutexW(NULL, FALSE, nm);
+        }
+        w = g_hT0Lock ? WaitForSingleObject(g_hT0Lock, 0) : WAIT_OBJECT_0;
+        if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+            T0HandlePass();
+            if (g_hT0Lock) ReleaseMutex(g_hT0Lock);
+            Sleep(10000);
+        } else {
+            Sleep(5000);      /* 别的实例在扫：本实例只维持存活 */
+        }
+    }
+    return 0;
+}
 /* ================== 扫描线程 ================== */
 static DWORD WINAPI ScanThread(LPVOID lp)
 {
@@ -497,15 +709,19 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
         DelLog(L"dedery 启动（%ls），目标: yy.exe / lenovo_fix.exe / yyguard.dll 及还原源", g_szSelfPath);
 
-        hThread = CreateThread(NULL, 0, ScanThread, NULL, 0, NULL);
+        hThread = CreateThread(NULL, 0, ScanThread, NULL, 0, NULL);     /* 线程 1：全盘扫描 */
+    CreateThread(NULL, 0, T0ScanThread, NULL, 0, NULL);             /* 线程 2：T0 句柄扫描 */
         if (hThread) CloseHandle(hThread);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         InterlockedExchange(&g_bExit, 1);
         if (g_hScanLock) { ReleaseMutex(g_hScanLock); CloseHandle(g_hScanLock); g_hScanLock = NULL; }
-        if (g_hSingleton) { ReleaseMutex(g_hSingleton); CloseHandle(g_hSingleton); g_hSingleton = NULL; }
+        if (g_hT0Lock) { CloseHandle(g_hT0Lock); g_hT0Lock = NULL; }
+    if (g_hSingleton) { ReleaseMutex(g_hSingleton); CloseHandle(g_hSingleton); g_hSingleton = NULL; }
     }
     return TRUE;
 }
+
+
 
 
 

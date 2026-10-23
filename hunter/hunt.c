@@ -1,8 +1,8 @@
 ﻿/*
- * hunt.c —— 对手识别三层（T0 / T1 / T2），由 killtools.c 直接 include
+ * hunt.c —— 对手识别 T1/T2，由 killtools.c 直接 include（T0 在 dedery.dll）
  *
- *   T0 所有权证据：谁持有我方进程句柄；谁在占位我方旧命名对象
- *                  —— 行为即敌意，不看名字、不看版本
+ *   T0 所有权证据：**已迁移到 dedery.dll**（与全盘扫描并行的第二个线程）
+ *                  —— 谁持有我方进程句柄，谁就是敌人
  *   T1 PE 结构指纹：导入表哈希 + 节表哈希 + 头字段
  *                  —— 改名无效，重编后仍能命中"结构族"
  *   T2 模糊匹配    ：导入集余弦 + 字符串 minhash Jaccard + .text 字节直方图余弦
@@ -33,29 +33,7 @@
 #define HUNT_SCORE_HIT         0.75   /* T2 融合分阈值 */
 #define HUNT_SCORE_SUSPECT     0.55
 
-/* ---------------- 本地依赖：NtQuerySystemInformation / 模块目录 ---------------- */
-typedef LONG NTSTATUS_HUNT;
-typedef LONG (NTAPI *HuntNtQuery_t)(ULONG, PVOID, ULONG, PULONG);
-
-static HuntNtQuery_t HuntNtQueryProc(void)
-{
-    static HuntNtQuery_t s_fn = NULL;
-    static BOOL s_tried = FALSE;
-    if (!s_tried) {
-        HMODULE h = GetModuleHandleW(L"ntdll.dll");
-        s_tried = TRUE;
-        if (!h) h = LoadLibraryW(L"ntdll.dll");
-        if (h) s_fn = (HuntNtQuery_t)GetProcAddress(h, "NtQuerySystemInformation");
-    }
-    return s_fn;
-}
-
-static LONG HuntNtQuery(ULONG cls, PVOID buf, ULONG size, PULONG ret)
-{
-    HuntNtQuery_t fn = HuntNtQueryProc();
-    if (!fn) return (LONG)0xC0000001L;
-    return fn(cls, buf, size, ret);
-}
+/* ---------------- 本地依赖：模块目录 ---------------- */
 
 /* 本模块所在目录（带尾部反斜杠） */
 static BOOL XXGetModuleDirW(WCHAR *out, SIZE_T cch)
@@ -425,170 +403,21 @@ static void HuntBuildBaseline(void)
         WriteKillLog(L"[HUNT] 没有找到基线样本（yy.exe/yyguard.dll 不在候选目录），T1/T2 只做自比对");
 }
 
-/* ---------------- T0：谁持有我方进程句柄 ---------------- */
-typedef struct {
-    DWORD ownerPid;
-    DWORD targetPid;
-    DWORD access;
-} HuntHandleHit;
-
-static USHORT HuntProcessTypeIndex(void)
-{
-    static USHORT s_idx = 0;
-    HANDLE hSelf;
-    ULONG size = 1 << 20, ret = 0;
-    unsigned char *buf;
-    LONG st;
-
-    if (s_idx) return s_idx;
-    hSelf = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentProcessId());
-    if (!hSelf) return 0;
-
-    for (;;) {
-        buf = (unsigned char *)malloc(size);
-        if (!buf) { CloseHandle(hSelf); return 0; }
-        st = HuntNtQuery(64 /*SystemExtendedHandleInformation*/, buf, size, &ret);
-        if (st == 0) break;
-        free(buf);
-        if (ret <= size || size >= (64u << 20)) { CloseHandle(hSelf); return 0; }
-        size = ret + (64 * 1024);
-    }
-
-    {
-        ULONG_PTR count = *(ULONG_PTR *)buf;
-        unsigned char *p = buf + 2 * sizeof(ULONG_PTR);
-        ULONG_PTR i;
-        for (i = 0; i < count; i++) {
-            /* 结构布局见 xxipc.h 的 XX_HANDLE_ENTRY 备注：这里按 40 字节/项走 */
-            DWORD pid = *(DWORD *)(p + 8);
-            ULONG_PTR handle = *(ULONG_PTR *)(p + 16);
-            USHORT typeIdx = *(USHORT *)(p + 30);   /* +30 ObjectTypeIndex */
-            if (pid == GetCurrentProcessId() && handle == (ULONG_PTR)hSelf) {
-                s_idx = typeIdx;
-                break;
-            }
-            p += 40;
-        }
-    }
-    free(buf);
-    CloseHandle(hSelf);
-    return s_idx;
-}
-
-static BOOL HuntIsOurPid(DWORD pid)
-{
-    WCHAR img[MAX_PATH] = L"";
-    DWORD cch = MAX_PATH;
-    HANDLE h;
-    const WCHAR *leaf;
-
-    if (!pid) return FALSE;
-    if (g_pSharedView && pid == XX_XXPID(g_pSharedView)) return TRUE;
-    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return FALSE;
-    if (!QueryFullProcessImageNameW(h, 0, img, &cch)) { CloseHandle(h); return FALSE; }
-    CloseHandle(h);
-    leaf = wcsrchr(img, L'\\');
-    leaf = leaf ? leaf + 1 : img;
-    return (_wcsicmp(leaf, L"xx.exe") == 0);
-}
-
-/* 返回命中条数 */
-static int HuntT0_HandleOwners(void)
-{
-    USHORT idx = HuntProcessTypeIndex();
-    ULONG size = 1 << 20, ret = 0;
-    unsigned char *buf;
-    LONG st;
-    int hits = 0;
-
-    if (!idx) return 0;
-    for (;;) {
-        buf = (unsigned char *)malloc(size);
-        if (!buf) return 0;
-        st = HuntNtQuery(64, buf, size, &ret);
-        if (st == 0) break;
-        free(buf);
-        if (ret <= size || size >= (64u << 20)) return 0;
-        size = ret + (64 * 1024);
-    }
-
-    {
-        ULONG_PTR count = *(ULONG_PTR *)buf;
-        unsigned char *p = buf + 2 * sizeof(ULONG_PTR);
-        ULONG_PTR i;
-        for (i = 0; i < count; i++) {
-            DWORD ownerPid = *(DWORD *)(p + 8);
-            ULONG_PTR handleValue = *(ULONG_PTR *)(p + 16);
-            USHORT typeIdx = *(USHORT *)(p + 30);   /* +30 ObjectTypeIndex */
-            DWORD access = *(DWORD *)(p + 24);        /* +24 GrantedAccess */
-
-            if (typeIdx == idx && ownerPid != GetCurrentProcessId() && ownerPid > 4) {
-                HANDLE hOwner = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
-                                            FALSE, ownerPid);
-                if (hOwner) {
-                    HANDLE hDup = NULL;
-                    if (DuplicateHandle(hOwner, (HANDLE)handleValue, GetCurrentProcess(), &hDup,
-                                        PROCESS_QUERY_LIMITED_INFORMATION, FALSE, 0) && hDup) {
-                        DWORD targetPid = GetProcessId(hDup);
-                        if (targetPid && HuntIsOurPid(targetPid)) {
-                            WCHAR ownerImg[MAX_PATH] = L"", *leaf;
-                            DWORD cch = MAX_PATH;
-                            if (QueryFullProcessImageNameW(hOwner, 0, ownerImg, &cch)) {
-                                leaf = wcsrchr(ownerImg, L'\\');
-                                leaf = leaf ? leaf + 1 : ownerImg;
-                            } else leaf = L"?";
-                            hits++;
-                            WriteKillLog(L"[HUNT][T0] PID=%lu(%ls) 持有我方进程 PID=%lu 的句柄 access=0x%lX",
-                                         ownerPid, leaf, targetPid, access);
-#if !HUNT_LEARN_ONLY
-                            if (TerminateProcess(hOwner, 0))
-                                WriteKillLog(L"[HUNT][T0] 已结束 PID=%lu（持有我方进程句柄）", ownerPid);
-#endif
-                        }
-                        CloseHandle(hDup);
-                    }
-                    CloseHandle(hOwner);
-                }
-            }
-            p += 40;
-        }
-    }
-    free(buf);
-    return hits;
-}
-
-/* T0-B：我方旧命名对象被占位 —— 我们早已不创建这些名字，存在即有人冒充 */
-static void HuntT0_SquatProbe(void)
-{
-    static const WCHAR *kSquat[] = {
-        L"Global\\xx_window_guard", L"Local\\xx_window_guard",
-        L"Global\\xx_window_make_guard", NULL
-    };
-    int i;
-    for (i = 0; kSquat[i]; i++) {
-        HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, kSquat[i]);
-        if (h) {
-            CloseHandle(h);
-            WriteKillLog(L"[HUNT][T0] 发现被占位的旧命名对象（第 %d 个）：有人冒充我方互斥体", i);
-        }
-    }
-}
+/* ---------------- T0 已迁移 ---------------- */
+/* T0（句柄所有权）在 dedery.dll：与全盘扫描并行的第二个线程。这里只保留 T1/T2。 */
 
 /* ---------------- 一层扫描入口 ---------------- */
 static void HuntPass(void)
 {
     HANDLE hSnap;
     PROCESSENTRY32W pe;
-    int seen = 0, t0 = 0, t1 = 0, t2 = 0, suspects = 0;
+    int seen = 0, t1 = 0, t2 = 0, suspects = 0;
 
     if (!HostIsXxExe()) return;      /* 只在交付本体里跑，避免 N 个宿主重复全盘扫描 */
     if (HUNT_LEARN_ONLY)
         ;                            /* 学习模式：只记日志 */
 
     HuntBuildBaseline();
-    t0 += HuntT0_HandleOwners();
-    HuntT0_SquatProbe();
 
     hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
@@ -651,13 +480,16 @@ next_proc:
     }
     CloseHandle(hSnap);
 
-    if (t0 || t1 || t2 || suspects)
-        WriteKillLog(L"[HUNT] 本轮: 扫描=%d T0=%d T1=%d T2命中=%d 疑似=%d%s",
-                     seen, t0, t1, t2, suspects,
+    if (t1 || t2 || suspects)
+        WriteKillLog(L"[HUNT] 本轮: 扫描=%d T1=%d T2命中=%d 疑似=%d%s",
+                     seen, t1, t2, suspects,
                      HUNT_LEARN_ONLY ? L"（学习模式：只记录，未动手）" : L"");
 }
 
 #endif /* XX_HUNT_C */
+
+
+
 
 
 
