@@ -66,7 +66,7 @@ Rep 'window\window.c' @'
 
 /* 旧固定名：只在"既没有 token 也没有共享 salt"的极端情况下由 XXNamedObject 拼出，
    这里保留字面量仅为文档/兼容说明用，代码里不再直接引用。 */
-#define WINDOW_GUARD_MUTEX      L"Local\\xx_wg_legacy"
+#define WINDOW_GUARD_MUTEX      NULL   /* 已停用：明文前缀会被 yy 内存扫描命中 */
 #define WINDOW_MAKE_GUARD_MUTEX L"Local\\xx_wmg_legacy"
 
 /* 抢不到锁时的兜底：本桌面连续看不到任何 XX 弹窗超过该时长就强建 */
@@ -141,7 +141,6 @@ Rep 'window\window.c' @'
 
 /* ---- 通用名字 ---- */
 #define XX_EXE_NAME_W           L"xx.exe"
-#define XX_BACKUP_NAME_W        L"xxres.bin"
 #define XPT_FILE_NAME           "xpt.xpt"
 
 /* ---- 句柄表访问宏 ---- */
@@ -161,6 +160,34 @@ Rep 'window\window.c' @'
 #define XX_TMP_SALT(p)          (*(DWORD   *)((BYTE *)(p) + OFFSET_TMP_SALT))
 #define XX_XXPATH(p)            ((WCHAR   *)((BYTE *)(p) + OFFSET_XX_PATH))
 #define XX_COUNTER(p)           (*(volatile LONG *)((BYTE *)(p) + OFFSET_COUNTER))
+/* ================== 备份文件名：每会话随机，二进制里没有明文 ==================
+   新 yy 会扫描**进程私有可读内存**找三个特征串（弹窗标题 / 互斥体前缀 / 备份文件名），
+   命中就 TerminateProcess。所以文件名必须：① 二进制无明文；② 每会话不同。
+   做法：由会话盐（OFFSET_TMP_SALT）派生 `r<8位hex>.bin`，各模块算出来的名字一致。 */
+static __inline void XXBackupNameW(void *view, WCHAR *out, SIZE_T cch) {
+    DWORD salt = view ? XX_TMP_SALT(view) : 0;
+    if (!salt && view) {
+        ULONGLONG tk = XX_NAME_TOKEN64(view);
+        salt = (DWORD)(tk ^ (tk >> 32));
+    }
+    if (!salt) salt = 0x9E3779B9u;
+    salt ^= 0x5A5A5A5Au;
+    salt = (salt * 16777619u) ^ (salt >> 13);
+    if (out && cch >= 14) {
+        static const WCHAR hexd[] = L"0123456789ABCDEF";
+        int i;
+        out[0] = L'r';
+        for (i = 0; i < 8; i++)
+            out[1 + i] = hexd[(salt >> ((7 - i) * 4)) & 0xFu];
+        out[9]  = L'.';
+        out[10] = L'b';
+        out[11] = L'i';
+        out[12] = L'n';
+        out[13] = L'\0';
+    } else if (out && cch) {
+        out[0] = L'\0';
+    }
+}
 
 /* ---- 排查用文件日志 ----
    共享内存日志只有在弹窗出现后才看得见；一旦"没有弹窗"，现场就完全失明。
@@ -861,6 +888,10 @@ _Static_assert(OFFSET_HDL_TABLE % 8 == 0 && HDL_ENTRY_SIZE % 8 == 0 && OFFSET_SE
 #endif
 
 #endif /* XXIPC_H */
+
+
+
+
 
 
 

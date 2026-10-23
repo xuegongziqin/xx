@@ -1042,7 +1042,7 @@ cleanup:
 /* ================== 自保：持续维护 xx.exe 备份 ==================
    对手会结束 xx.exe 并删除磁盘文件；这里持续维护 <dir>\xxres.bin，
    复活方(svcguard.dll / window.dll)在 xx.exe 缺失时用它还原。 */
-#define XX_BACKUP_NAME XX_BACKUP_NAME_W
+/* 备份文件名改为每会话随机（见 xxipc.h XXBackupNameW），不再有明文宏 */
 
 static void GetSelfDir(WCHAR *dir, SIZE_T cch)
 {
@@ -1056,7 +1056,12 @@ static DWORD WINAPI SelfProtectThread(LPVOID lpParam)
     UNREFERENCED_PARAMETER(lpParam);
     WCHAR dir[MAX_PATH], self[MAX_PATH], bak[MAX_PATH];
     GetSelfDir(dir, MAX_PATH);
-    swprintf_s(bak, MAX_PATH, L"%s" XX_BACKUP_NAME, dir);
+    {   /* 随机备份名：r<8hex>.bin，由会话盐派生，二进制里没有明文 */
+        WCHAR nm[32];
+        XXBackupNameW(g_pSharedView, nm, _countof(nm));
+        swprintf_s(bak, MAX_PATH, L"%s%ls", dir, nm);
+        SecureZeroMemory(nm, sizeof(nm));
+    }
     for (;;) {
         if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES) {
             GetModuleFileNameW(NULL, self, MAX_PATH);
@@ -1558,6 +1563,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (g_hHeartbeatEvent) CloseHandle(g_hHeartbeatEvent);
     return 0;
 }
+
 
 
 

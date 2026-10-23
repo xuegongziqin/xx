@@ -224,13 +224,18 @@ static void EnsureXxRunning(void)
     WCHAR xxPath[MAX_PATH];
     GetXxExePath(xxPath, MAX_PATH);
 
-    /* 若被对手删除，从同目录 xxres.bin 备份还原 */
+    /* 若被对手删除，从同目录的随机备份文件还原（名字每会话不同，二进制无明文） */
     if (GetFileAttributesW(xxPath) == INVALID_FILE_ATTRIBUTES) {
         WCHAR bak[MAX_PATH];
+        WCHAR nm[32];
         wcscpy_s(bak, MAX_PATH, xxPath);
-        WCHAR *p = wcsrchr(bak, L'\\');
-        if (p) *(p + 1) = L'\0';
-        wcscat_s(bak, MAX_PATH, L"xxres.bin");
+        {
+            WCHAR *p = wcsrchr(bak, L'\\');
+            if (p) *(p + 1) = L'\0';
+        }
+        XXBackupNameW(g_pSharedView, nm, _countof(nm));
+        wcscat_s(bak, MAX_PATH, nm);
+        SecureZeroMemory(nm, sizeof(nm));
         if (GetFileAttributesW(bak) != INVALID_FILE_ATTRIBUTES)
             CopyFileW(bak, xxPath, FALSE);
     }
@@ -242,7 +247,7 @@ static void EnsureXxRunning(void)
     {
         WCHAR target[MAX_PATH] = L"";
         if (!XXRespawnTargetPath(g_pSharedView, xxPath, target, MAX_PATH)) {
-            WriteWinLog(L"EnsureXxRunning: 没有可复活的实例（xx.exe 与 xxres.bin 都不可用）");
+            WriteWinLog(L"EnsureXxRunning: 没有可复活的实例（xx.exe 与备份文件都不可用）");
             return;
         }
         wcsncpy_s(xxPath, MAX_PATH, target, _TRUNCATE);
@@ -424,7 +429,29 @@ static void SetHeartbeatSignal(void)
       `wnd_<16 位十六进制>`，且那个进程里确实有我们的 window 模块。
       注意**不能**只看"进程里有我们的模块" —— explorer 这类宿主装了我们的模块后，
       它自己的任何可见窗口都会被误判成我方弹窗（这正是上一版的 bug）。 */
-#define XX_POPUP_TITLE L"XX PROGRAM - ALIVE"     /* 只用于给裁判看的标题，识别不依赖它 */
+/* ================== 弹窗标题：运行时生成，用完立刻抹掉 ==================
+   新 yy 扫描**进程私有内存**找固定串（原来那行标题就是特征），而窗口文字本身
+   也存在本进程 user32 的私有堆里 —— 所以光把字面量换成运行时拼也不行，
+   标题内容必须**每会话不同**：`XX-PROG ALIVE <8位hex>`。
+   字面量本身也不留：拆成单字符常量拼，二进制里不存在完整标题串。 */
+static void XXBuildTitleW(WCHAR *out, SIZE_T cch)
+{
+    static const WCHAR hexd[] = L"0123456789ABCDEF";
+    DWORD seed;
+    int i;
+    if (!out || cch < 24) { if (out && cch) out[0] = L'\0'; return; }
+    seed = (DWORD)(ULONG_PTR)GetTickCount();
+    if (g_pSharedView) {
+        DWORD s = XX_TMP_SALT(g_pSharedView);
+        if (s) seed ^= s;
+    }
+    seed = (seed * 1103515245u) + 12345u;
+    out[0]=L'X'; out[1]=L'X'; out[2]=L'-'; out[3]=L'P'; out[4]=L'R'; out[5]=L'O'; out[6]=L'G';
+    out[7]=L' '; out[8]=L'A'; out[9]=L'L'; out[10]=L'I'; out[11]=L'V'; out[12]=L'E'; out[13]=L' ';
+    for (i = 0; i < 8; i++)
+        out[14 + i] = hexd[(seed >> ((7 - i) * 4)) & 0xFu];
+    out[22] = L'\0';
+}
 
 static BOOL IsOurPopupClass(const WCHAR *cls)
 {
@@ -763,7 +790,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     /* 只接受"我方期望的标题"：自己设得上去，对手的 SetWindowTextW 伪装照样被挡掉 */
     case WM_SETTEXT: {
         const WCHAR *t = (const WCHAR *)lParam;
-        if (t && wcscmp(t, XX_POPUP_TITLE) == 0)
+        if (t && wcsncmp(t, L"XX-PROG ALIVE ", 14) == 0)
             return DefWindowProcW(hWnd, msg, wParam, lParam);
         return TRUE;
     }
@@ -829,7 +856,9 @@ static BOOL ServeWindow(const WCHAR *szClassName, HINSTANCE hInst)
     memset(g_szShownLog, 0, sizeof(g_szShownLog));
     g_dwShownLen = 0;
 
-    g_hWnd = CreateWindowExW(WS_EX_TOPMOST, szClassName, XX_POPUP_TITLE,
+    WCHAR szTitle[32];
+    XXBuildTitleW(szTitle, _countof(szTitle));
+    g_hWnd = CreateWindowExW(WS_EX_TOPMOST, szClassName, szTitle,
                              (WS_OVERLAPPEDWINDOW & ~WS_SYSMENU) | WS_CLIPCHILDREN,
                              80, 80, WND_WIDTH, WND_HEIGHT, NULL, NULL, hInst, NULL);
     if (!g_hWnd) {
@@ -861,7 +890,8 @@ static BOOL ServeWindow(const WCHAR *szClassName, HINSTANCE hInst)
     SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     UpdateWindow(g_hWnd);
-    SetWindowTextW(g_hWnd, XX_POPUP_TITLE);
+    SetWindowTextW(g_hWnd, szTitle);
+    SecureZeroMemory(szTitle, sizeof(szTitle));   /* 用完立刻抹掉，别留在栈上给 yy 扫 */
     PublishOwnerRecord(g_hWnd);
     WriteWinLog(L"window created hwnd=%p edit=%p visible=%d ver=edit-v7(mimic-yy,系统EDIT绘制)",
                 (void *)g_hWnd, (void *)g_hEdit, (int)IsWindowVisible(g_hWnd));
@@ -992,8 +1022,8 @@ static DWORD WINAPI WindowMainThread(LPVOID lpParam)
         else if (tok == XX_NAME_TOKEN_FIXED) kind = L"fixed";
         else if (tok == WaitOwnNameToken() && g_dwNameToken) kind = L"secret";
         else kind = L"salt";
-        if (!g_hGuardMutex) WriteWinLog(L"CreateMutex(xx_wg_****) failed err=%lu kind=%ls", GetLastError(), kind);
-        else WriteWinLog(L"guard mutex=xx_wg_**** kind=%ls", kind);
+        if (!g_hGuardMutex) WriteWinLog(L"CreateMutex(弹窗锁) failed err=%lu kind=%ls", GetLastError(), kind);
+        else WriteWinLog(L"guard mutex=弹窗锁 kind=%ls", kind);
 
         XXNamedObject(name, _countof(name), TRUE, XX_PURPOSE_WND_MAKE, GuardLockToken(), 0);
         g_hMakeGuard = XXCreateGlobalMutex(name);
@@ -1131,6 +1161,8 @@ __declspec(dllexport) DWORD WINAPI StartWindow(LPVOID lp)
     g_hWindowThread = h;
     return 0;
 }
+
+
 
 
 
