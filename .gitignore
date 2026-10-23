@@ -64,3 +64,7 @@ Desktop.ini
 /test/yyguard_fixed.dll
 /test/yyguard_reconstructed.dll
 /xx/xx.c.broken_tail
+
+# ---------- 对手程序反汇编（yy 有自己的仓库，不入库）----------
+/test/testyy/*.asm
+/test/testyy/*.dis
