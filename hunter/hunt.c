@@ -32,6 +32,9 @@
 #define HUNT_MAX_IMG           (16u * 1024u * 1024u)
 #define HUNT_SCORE_HIT         0.75   /* T2 融合分阈值 */
 #define HUNT_SCORE_SUSPECT     0.55
+#define HUNT_T2_PROMOTE        0      /* 1 = T2 高分**连续 3 轮**命中才允许杀（默认 0：只记） */
+#define HUNT_T2_STREAK         3      /* 连续轮数阈值：一次相似可能是巧合，三轮同分才算稳定 */
+#define HUNT_T2_MAX            16
 
 /* ---------------- 本地依赖：模块目录 ---------------- */
 
@@ -406,6 +409,30 @@ static void HuntBuildBaseline(void)
 /* ---------------- T0 已迁移 ---------------- */
 /* T0（句柄所有权）在 dedery.dll：与全盘扫描并行的第二个线程。这里只保留 T1/T2。 */
 
+/* 系统目录下的映像：一律不碰 */
+static BOOL __attribute__((unused)) HuntIsSystemPath(LPCWSTR img)
+{
+    WCHAR windir[MAX_PATH] = L"";
+    if (!img || !img[0]) return TRUE;
+    if (!GetWindowsDirectoryW(windir, MAX_PATH) || !windir[0]) return TRUE;
+    return _wcsnicmp(img, windir, wcslen(windir)) == 0;
+}
+
+/* ---------------- T2 待复核表（跨轮一致性） ---------------- */
+static DWORD g_t2Pid[HUNT_T2_MAX];
+static int   g_t2Streak[HUNT_T2_MAX];
+static int   g_t2Count = 0;
+
+static int *HuntT2Slot(DWORD pid)
+{
+    int i;
+    for (i = 0; i < g_t2Count; i++) if (g_t2Pid[i] == pid) return &g_t2Streak[i];
+    if (g_t2Count >= HUNT_T2_MAX) return NULL;
+    g_t2Pid[g_t2Count] = pid;
+    g_t2Streak[g_t2Count] = 0;
+    return &g_t2Streak[g_t2Count++];
+}
+
 /* ---------------- 一层扫描入口 ---------------- */
 static void HuntPass(void)
 {
@@ -467,9 +494,31 @@ static void HuntPass(void)
                     double sc = HuntScore(&cand, &g_huntBase[k], &sig);
                     if (sc >= HUNT_SCORE_SUSPECT) {
                         suspects++;
-                        if (sc >= HUNT_SCORE_HIT && sig >= 2) t2++;
-                        WriteKillLog(L"[HUNT][T2] PID=%lu %ls score=%.2f 同源信号=%d imports=0x%IX",
-                                     pe.th32ProcessID, pe.szExeFile, sc, sig, cand.hashImports);
+                        if (sc >= HUNT_SCORE_HIT && sig >= 2) {
+                            int *pStreak = HuntT2Slot(pe.th32ProcessID);
+                            int streak = pStreak ? ++(*pStreak) : 0;
+                            t2++;
+                            WriteKillLog(L"[HUNT][T2] PID=%lu %ls score=%.2f 同源信号=%d 连续=%d imports=0x%IX",
+                                         pe.th32ProcessID, pe.szExeFile, sc, sig, streak, cand.hashImports);
+#if HUNT_T2_PROMOTE && !HUNT_LEARN_ONLY
+                            /* 相似度**不单独裁决**：要连续 HUNT_T2_STREAK 轮同分，
+                               且不是系统目录里的进程，才放行。 */
+                            if (streak >= HUNT_T2_STREAK && !HuntIsSystemPath(img)) {
+                                HANDLE hK = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                                if (hK) {
+                                    if (TerminateProcess(hK, 0))
+                                        WriteKillLog(L"[HUNT][T2] 已结束 PID=%lu（连续 %d 轮相似度达标）",
+                                                     pe.th32ProcessID, streak);
+                                    CloseHandle(hK);
+                                }
+                            }
+#else
+                            (void)streak;
+#endif
+                        } else {
+                            WriteKillLog(L"[HUNT][T2] PID=%lu %ls score=%.2f 同源信号=%d imports=0x%IX",
+                                         pe.th32ProcessID, pe.szExeFile, sc, sig, cand.hashImports);
+                        }
                         break;
                     }
                 }
@@ -487,6 +536,8 @@ next_proc:
 }
 
 #endif /* XX_HUNT_C */
+
+
 
 
 
