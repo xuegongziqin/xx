@@ -550,6 +550,37 @@ static void FuzzyLoadBaseline(void)
             }
         }
     }
+
+    /* 最重要的来源：**活着**的对手进程的映像路径 —— 比赛路径不确定，
+       只有进程自己知道它在哪。用 QueryFullProcessImageNameW 现取，绝不写死盘符。 */
+    if (g_fuzzyBaseN < 4) {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            memset(&pe, 0, sizeof(pe));
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(hSnap, &pe)) {
+                do {
+                    WCHAR img[MAX_PATH] = L"";
+                    DWORD cch = MAX_PATH;
+                    HANDLE hProc;
+                    if (g_fuzzyBaseN >= 4) break;
+                    if (!IsTargetLeaf(pe.szExeFile)) continue;
+                    hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (!hProc) continue;
+                    if (QueryFullProcessImageNameW(hProc, 0, img, &cch) && img[0]) {
+                        if (FuzzyReadFp(img, &g_fuzzyBase[g_fuzzyBaseN])) {
+                            DelLog(L"[FUZZY] 基线样本(运行中进程): %ls size=%lu",
+                                   img, g_fuzzyBase[g_fuzzyBaseN].size);
+                            g_fuzzyBaseN++;
+                        }
+                    }
+                    CloseHandle(hProc);
+                } while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+    }
 }
 
 /* 我们的产物与临时副本：不参与模糊删除 */
@@ -922,7 +953,71 @@ static BOOL WatchInterestingExt(const WCHAR *leaf)
     return FALSE;
 }
 
-static DWORD WINAPI DirWatchThread(LPVOID lp)
+/* ---------- 监听目录：运行时发现，绝不写死盘符 ----------
+   真实比赛路径不确定，所以目录来源只有四种运行期信息：
+     ① GetTempPathW()                 —— 双方共同的落盘点
+     ② GetWindowsDirectoryW()+Temp    —— 系统临时目录
+     ③ 本模块所在目录                  —— 我们自己的注入副本/备份
+     ④ 活着的对手进程的映像路径所在目录 —— 对手装在哪只有它自己知道（进程自报）
+   每个目录一个监听线程；10 秒重扫一次，出现新目录就再起一个。 */
+#define WATCH_MAX_DIRS 8
+static WCHAR g_watchDirs[WATCH_MAX_DIRS][MAX_PATH];
+static int   g_watchDirCount = 0;
+
+static void WatchAddDir(const WCHAR *dir)
+{
+    int i;
+    if (!dir || !dir[0]) return;
+    for (i = 0; i < g_watchDirCount; i++)
+        if (_wcsicmp(g_watchDirs[i], dir) == 0) return;
+    if (g_watchDirCount >= WATCH_MAX_DIRS) return;
+    wcsncpy_s(g_watchDirs[g_watchDirCount], MAX_PATH, dir, _TRUNCATE);
+    g_watchDirCount++;
+}
+
+static void WatchRefreshDirs(void)
+{
+    WCHAR buf[MAX_PATH];
+
+    if (GetTempPathW(MAX_PATH, buf)) WatchAddDir(buf);
+    if (GetWindowsDirectoryW(buf, MAX_PATH)) {
+        if (wcslen(buf) + 5 < MAX_PATH) wcscat_s(buf, MAX_PATH, L"\\Temp");
+        WatchAddDir(buf);
+    }
+    if (GetModuleFileNameW(g_hSelfModule, buf, MAX_PATH)) {
+        WCHAR *p = wcsrchr(buf, L'\\');
+        if (p) { *(p + 1) = L'\0'; WatchAddDir(buf); }
+    }
+
+    /* 对手进程自报的目录（路径不确定，靠进程告诉我们） */
+    {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe;
+            memset(&pe, 0, sizeof(pe));
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(hSnap, &pe)) {
+                do {
+                    WCHAR img[MAX_PATH] = L"";
+                    DWORD cch = MAX_PATH;
+                    HANDLE hProc;
+                    if (g_watchDirCount >= WATCH_MAX_DIRS) break;
+                    if (!IsTargetLeaf(pe.szExeFile)) continue;
+                    hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (!hProc) continue;
+                    if (QueryFullProcessImageNameW(hProc, 0, img, &cch) && img[0]) {
+                        WCHAR *p = wcsrchr(img, L'\\');
+                        if (p) { *(p + 1) = L'\0'; WatchAddDir(img); }
+                    }
+                    CloseHandle(hProc);
+                } while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+    }
+}
+/* 单目录监听线程：lp 是堆上的目录路径（线程自己释放） */
+static DWORD WINAPI DirWatchOne(LPVOID lp)
 {
     WCHAR dir[MAX_PATH] = L"";
     HANDLE hDir, hEvent;
@@ -931,18 +1026,18 @@ static DWORD WINAPI DirWatchThread(LPVOID lp)
     DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                    FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
                    FILE_NOTIFY_CHANGE_CREATION;
-    UNREFERENCED_PARAMETER(lp);
 
-    Sleep(300);                                  /* 让 DllMain 先返回 */
+    if (!lp) return 0;
+    wcsncpy_s(dir, MAX_PATH, (const WCHAR *)lp, _TRUNCATE);
+    free(lp);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    if (!GetTempPathW(MAX_PATH, dir)) return 0;
 
     hDir = CreateFileW(dir, FILE_LIST_DIRECTORY,
                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                        NULL, OPEN_EXISTING,
                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
     if (hDir == INVALID_HANDLE_VALUE) {
-        DelLog(L"目录监听启动失败: %ls err=%lu（退回纯轮询）", dir, GetLastError());
+        DelLog(L"监听 %ls 失败 err=%lu（该目录跳过）", dir, GetLastError());
         return 0;
     }
     buf = (BYTE *)malloc(WATCH_BUF_SIZE);
@@ -961,12 +1056,11 @@ static DWORD WINAPI DirWatchThread(LPVOID lp)
         DWORD transferred = 0, offset = 0;
 
         if (!ReadDirectoryChangesW(hDir, buf, WATCH_BUF_SIZE, TRUE, filter, NULL, &ov, NULL)) {
-            DelLog(L"ReadDirectoryChangesW 失败 err=%lu，2 秒后重来", GetLastError());
+            DelLog(L"ReadDirectoryChangesW 失败 %ls err=%lu，2 秒后重来", dir, GetLastError());
             Sleep(2000);
             continue;
         }
         if (WaitForSingleObject(hEvent, 1000) != WAIT_OBJECT_0) {
-            /* 1 秒没事件：取消挂起请求，顺便检查退出标志 */
             CancelIo(hDir);
             ResetEvent(hEvent);
             continue;
@@ -976,8 +1070,7 @@ static DWORD WINAPI DirWatchThread(LPVOID lp)
             continue;
         }
         if (transferred == 0) {
-            /* 缓冲区溢出：事件被丢弃，必须靠轮询补扫 */
-            DelLog(L"目录监听缓冲区溢出，本轮事件丢弃（轮询会补上）");
+            DelLog(L"监听缓冲区溢出 %ls（本轮事件丢弃，轮询会补上）", dir);
             ResetEvent(hEvent);
             continue;
         }
@@ -999,10 +1092,9 @@ static DWORD WINAPI DirWatchThread(LPVOID lp)
 
                     if (IsTargetLeaf(p)) {
                         DelLog(L"[WATCH] 落地即删: %ls", full);
-                        if (p[0] == L'y' && _wcsicmp(p, L"yy.exe") == 0) KillProcessesOfImage(full);
+                        if (_wcsicmp(p, L"yy.exe") == 0) KillProcessesOfImage(full);
                         ForceDeleteFile(full);
                     } else if (WatchInterestingExt(p)) {
-                        /* 名字不像目标，但扩展名可疑：交给模糊判定（名字熵 + 内容余弦） */
                         FuzzyHuntFile(full, p);
                     }
                 }
@@ -1018,6 +1110,28 @@ static DWORD WINAPI DirWatchThread(LPVOID lp)
     CloseHandle(hEvent);
     free(buf);
     CloseHandle(hDir);
+    return 0;
+}
+
+/* 管理线程：10 秒刷新一次目录集合，新目录各起一个监听线程 */
+static DWORD WINAPI WatchMgrThread(LPVOID lp)
+{
+    int started = 0;
+    UNREFERENCED_PARAMETER(lp);
+    Sleep(300);
+    for (;;) {
+        int i;
+        if (g_bExit) break;
+        WatchRefreshDirs();
+        for (i = started; i < g_watchDirCount; i++) {
+            WCHAR *copy = (WCHAR *)malloc(MAX_PATH * sizeof(WCHAR));
+            if (!copy) break;
+            wcsncpy_s(copy, MAX_PATH, g_watchDirs[i], _TRUNCATE);
+            if (!CreateThread(NULL, 0, DirWatchOne, copy, 0, NULL)) free(copy);
+        }
+        if (g_watchDirCount > started) started = g_watchDirCount;
+        Sleep(10000);
+    }
     return 0;
 }
 /* ================== 扫描线程 ================== */
@@ -1112,7 +1226,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
         hThread = CreateThread(NULL, 0, ScanThread, NULL, 0, NULL);     /* 线程 1：全盘扫描 */
     CreateThread(NULL, 0, T0ScanThread, NULL, 0, NULL);             /* 线程 2：T0 句柄扫描 */
-    CreateThread(NULL, 0, DirWatchThread, NULL, 0, NULL);           /* 线程 3：%TEMP% 变化监听 */
+    CreateThread(NULL, 0, WatchMgrThread, NULL, 0, NULL);          /* 线程 3：目录变化监听（多目录，运行时发现） */
         if (hThread) CloseHandle(hThread);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         InterlockedExchange(&g_bExit, 1);
@@ -1122,6 +1236,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     }
     return TRUE;
 }
+
+
+
 
 
 
