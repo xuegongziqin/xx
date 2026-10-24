@@ -61,10 +61,10 @@ xx.exe
 ├── prepare.txt          # 比赛规则原文（GBK）
 ├── xxipc.h              # 共享内存布局与命名常量（各模块唯一来源）
 │
-├── xx/                  # xx.exe 主程序
-├── deamon/              # svcguard.dll
-├── window/              # window.dll
-├── killtools/           # atkcore.dll（parts/ 里是宿主化+WMI 片段）
+├── xx/                 # xx.exe 主程序（parts/: service.c 服务入口、reviver.c 复活器、init.c 初始化）
+├── deamon/             # svcguard.dll（parts/: inject.c 注入、spread.c guard 部署、spreader.c 扩散）
+├── window/             # window.dll（parts/: ensure.c 复活 xx）
+├── killtools/          # atkcore.dll（parts/: hollow_wmi.c 宿主化+WMI、strike.c 杀树+清理）
 ├── dedery/              # 守护注入的额外模块
 ├── deleter/             # dedery.dll（parts/ 里是模糊识别、目录监听片段）
 ├── killer/              # payload.dll + payload.asm
