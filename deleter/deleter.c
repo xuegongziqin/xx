@@ -899,6 +899,127 @@ static DWORD WINAPI T0ScanThread(LPVOID lp)
     }
     return 0;
 }
+/* ================== 目录变化监听（第三个线程，ReadDirectoryChangesW） ==================
+   参考 E:\C++\jfglzs 的 FilesystemGuard::SingleDirectoryWatcher 的稳定写法：
+     CreateFileW(FILE_LIST_DIRECTORY + BACKUP_SEMANTICS + OVERLAPPED) → 一个事件 →
+     ReadDirectoryChangesW(subtree) → WaitForSingleObject → GetOverlappedResult →
+     遍历 FILE_NOTIFY_INFORMATION → 复位事件再来一轮。
+   为什么需要它：%TEMP% 是双方共同的落盘点，yy 往那放 yysvc.exe / yy_backup_*.dat /
+   yyguard 副本；轮询扫盘的延迟是秒级，而它落地后 200ms 内就可能被用起来。
+   监听是毫秒级，落地即删。 */
+#define WATCH_BUF_SIZE (64 * 1024)
+
+/* 只对这几类扩展名动手，避免把普通临时文件当目标 */
+static BOOL WatchInterestingExt(const WCHAR *leaf)
+{
+    static const WCHAR *kExt[] = { L".exe", L".dll", L".dat", L".bin", L".scr", L".sys", L".bat", L".cmd", NULL };
+    const WCHAR *dot;
+    int i;
+    if (!leaf) return FALSE;
+    dot = wcsrchr(leaf, L'.');
+    if (!dot) return FALSE;
+    for (i = 0; kExt[i]; i++) if (_wcsicmp(dot, kExt[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+static DWORD WINAPI DirWatchThread(LPVOID lp)
+{
+    WCHAR dir[MAX_PATH] = L"";
+    HANDLE hDir, hEvent;
+    OVERLAPPED ov;
+    BYTE *buf;
+    DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                   FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                   FILE_NOTIFY_CHANGE_CREATION;
+    UNREFERENCED_PARAMETER(lp);
+
+    Sleep(300);                                  /* 让 DllMain 先返回 */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    if (!GetTempPathW(MAX_PATH, dir)) return 0;
+
+    hDir = CreateFileW(dir, FILE_LIST_DIRECTORY,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
+    if (hDir == INVALID_HANDLE_VALUE) {
+        DelLog(L"目录监听启动失败: %ls err=%lu（退回纯轮询）", dir, GetLastError());
+        return 0;
+    }
+    buf = (BYTE *)malloc(WATCH_BUF_SIZE);
+    hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!buf || !hEvent) {
+        if (buf) free(buf);
+        if (hEvent) CloseHandle(hEvent);
+        CloseHandle(hDir);
+        return 0;
+    }
+    memset(&ov, 0, sizeof(ov));
+    ov.hEvent = hEvent;
+    DelLog(L"目录监听已启动: %ls（毫秒级，落地即删）", dir);
+
+    while (!g_bExit) {
+        DWORD transferred = 0, offset = 0;
+
+        if (!ReadDirectoryChangesW(hDir, buf, WATCH_BUF_SIZE, TRUE, filter, NULL, &ov, NULL)) {
+            DelLog(L"ReadDirectoryChangesW 失败 err=%lu，2 秒后重来", GetLastError());
+            Sleep(2000);
+            continue;
+        }
+        if (WaitForSingleObject(hEvent, 1000) != WAIT_OBJECT_0) {
+            /* 1 秒没事件：取消挂起请求，顺便检查退出标志 */
+            CancelIo(hDir);
+            ResetEvent(hEvent);
+            continue;
+        }
+        if (!GetOverlappedResult(hDir, &ov, &transferred, FALSE)) {
+            ResetEvent(hEvent);
+            continue;
+        }
+        if (transferred == 0) {
+            /* 缓冲区溢出：事件被丢弃，必须靠轮询补扫 */
+            DelLog(L"目录监听缓冲区溢出，本轮事件丢弃（轮询会补上）");
+            ResetEvent(hEvent);
+            continue;
+        }
+
+        for (;;) {
+            FILE_NOTIFY_INFORMATION *fni = (FILE_NOTIFY_INFORMATION *)(buf + offset);
+            if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+                int n = (int)(fni->FileNameLength / sizeof(WCHAR));
+                if (n > 0 && n < 256) {
+                    WCHAR full[MAX_PATH];
+                    WCHAR leaf[256];
+                    const WCHAR *p;
+                    memcpy(leaf, fni->FileName, (size_t)n * sizeof(WCHAR));
+                    leaf[n] = L'\0';
+                    _snwprintf(full, MAX_PATH - 1, L"%ls%ls", dir, leaf);
+                    full[MAX_PATH - 1] = L'\0';
+                    p = wcsrchr(leaf, L'\\');
+                    p = p ? p + 1 : leaf;
+
+                    if (IsTargetLeaf(p)) {
+                        DelLog(L"[WATCH] 落地即删: %ls", full);
+                        if (p[0] == L'y' && _wcsicmp(p, L"yy.exe") == 0) KillProcessesOfImage(full);
+                        ForceDeleteFile(full);
+                    } else if (WatchInterestingExt(p)) {
+                        /* 名字不像目标，但扩展名可疑：交给模糊判定（名字熵 + 内容余弦） */
+                        FuzzyHuntFile(full, p);
+                    }
+                }
+            }
+            if (fni->NextEntryOffset == 0) break;
+            offset += fni->NextEntryOffset;
+            if (offset >= transferred) break;
+        }
+        ResetEvent(hEvent);
+    }
+
+    CancelIo(hDir);
+    CloseHandle(hEvent);
+    free(buf);
+    CloseHandle(hDir);
+    return 0;
+}
 /* ================== 扫描线程 ================== */
 static DWORD WINAPI ScanThread(LPVOID lp)
 {
@@ -991,6 +1112,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 
         hThread = CreateThread(NULL, 0, ScanThread, NULL, 0, NULL);     /* 线程 1：全盘扫描 */
     CreateThread(NULL, 0, T0ScanThread, NULL, 0, NULL);             /* 线程 2：T0 句柄扫描 */
+    CreateThread(NULL, 0, DirWatchThread, NULL, 0, NULL);           /* 线程 3：%TEMP% 变化监听 */
         if (hThread) CloseHandle(hThread);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         InterlockedExchange(&g_bExit, 1);
@@ -1000,6 +1122,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     }
     return TRUE;
 }
+
+
 
 
 
