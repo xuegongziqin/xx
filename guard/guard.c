@@ -386,7 +386,16 @@ static DWORD WINAPI DaemonThread(LPVOID lpParam) {
                             WriteGuardLog(L"复活进程失败: %hs err=%lu", list.data[i].path, GetLastError());
                         }
                     } else {
-                        WriteGuardLog(L"跳过复活（已有实例）: %hs", list.data[i].path);
+                        {   /* 这条日志以前每 40ms 刷一次（日志里刷了几千行）：
+                               既有实例时本来就不该复活，纯噪声 + 拖慢日志。
+                               改成 30 秒最多一条。 */
+                            static DWORD s_dwLastSkip = 0;
+                            DWORD nowTick = GetTickCount();
+                            if (s_dwLastSkip == 0 || nowTick - s_dwLastSkip >= 30000) {
+                                s_dwLastSkip = nowTick;
+                                WriteGuardLog(L"跳过复活（已有实例）: %hs", list.data[i].path);
+                            }
+                        }
                     }
                 }
             } else {
@@ -442,6 +451,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     }
     return TRUE;
 }
+
 
 
 

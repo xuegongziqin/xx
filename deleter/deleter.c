@@ -464,6 +464,21 @@ static BOOL T0IsOurPid(DWORD pid)
     if (!h) return FALSE;
     if (!QueryFullProcessImageNameW(h, 0, img, &cch)) { CloseHandle(h); return FALSE; }
     CloseHandle(h);
+
+    /* 我们自己的复活器副本（%TEMP%\svchost.exe / explorer.exe / conhost.exe）也是"我方进程"，
+       但它们同样会持有 xx 的句柄 —— 不排掉就会出现"T0 杀掉自己的复活器"（日志里已发生）。 */
+    {
+        WCHAR tdir[MAX_PATH] = L"", mine[MAX_PATH];
+        static const WCHAR *kCopies[] = { L"svchost.exe", L"explorer.exe", L"conhost.exe", NULL };
+        int k;
+        if (GetTempPathW(MAX_PATH, tdir)) {
+            for (k = 0; kCopies[k]; k++) {
+                swprintf_s(mine, MAX_PATH, L"%ls%ls", tdir, kCopies[k]);
+                if (_wcsicmp(img, mine) == 0) return FALSE;
+            }
+        }
+    }
+
     leaf = wcsrchr(img, L'\\');
     leaf = leaf ? leaf + 1 : img;
     return (_wcsicmp(leaf, L"xx.exe") == 0);
@@ -582,7 +597,13 @@ static void T0HandlePass(void)
         target = GetProcessId(hDup);
         CloseHandle(hDup);
 
-        if (target && T0IsOurPid(target)) {
+        /* 只有"能杀/能写/能挂起"的句柄才算敌意。
+           日志里踩过：explorer 用 SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION(0x101000)
+           打开过 xx（给子进程做存活跟踪），纯良性命柄，却把 explorer 当敌人杀了。 */
+        if (target && T0IsOurPid(target) &&
+            (e->GrantedAccess & (PROCESS_TERMINATE | PROCESS_CREATE_THREAD |
+                                 PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                                 PROCESS_SUSPEND_RESUME)) != 0) {
             WCHAR img[MAX_PATH] = L"", *leaf;
             DWORD cch = MAX_PATH;
             hits++;
@@ -595,12 +616,16 @@ static void T0HandlePass(void)
             if (T0IsSystemImage(owner)) {
                 DelLog(L"[T0] PID=%lu 是系统目录下的进程：只记录，不动手", owner);
             } else {
-                HANDLE hK = OpenProcess(PROCESS_TERMINATE, FALSE, owner);
+                HANDLE hK = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, owner);
                 if (hK) {
-                    if (TerminateProcess(hK, 0))
-                        DelLog(L"[T0] 已结束 PID=%lu（持有我方进程句柄）", owner);
-                    else
+                    if (TerminateProcess(hK, 0)) {
+                        if (WaitForSingleObject(hK, 300) == WAIT_OBJECT_0)
+                            DelLog(L"[T0] 已结束 PID=%lu（已确认退出）", owner);
+                        else
+                            DelLog(L"[T0] 已下发终止但进程仍在 PID=%lu（300ms 超时）", owner);
+                    } else {
                         DelLog(L"[T0] 结束 PID=%lu 失败 err=%lu", owner, GetLastError());
+                    }
                     CloseHandle(hK);
                 } else {
                     DelLog(L"[T0] 打不开 PID=%lu 的终止权限 err=%lu", owner, GetLastError());
@@ -742,6 +767,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     }
     return TRUE;
 }
+
 
 
 

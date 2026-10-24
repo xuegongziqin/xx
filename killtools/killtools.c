@@ -1,4 +1,4 @@
-﻿/*
+/*
  * atkcore.dll - 精简攻击工具箱
  * 功能：循环扫描并终止 yy.exe / ww.exe
  * 保留五种结束方式：
@@ -1776,14 +1776,15 @@ static int XXEnumProcessesFast(DWORD *pids, WCHAR (*names)[64], int maxPids)
     return n;
 }
 
-/* 挂起 + 终止（B3）。先冻住再杀：对手的 VEH/守护线程来不及反应。 */
+/* 挂起 + 终止（B3）。先冻住再杀：对手的 VEH/守护线程来不及反应。
+   **不再缓存句柄**：日志里"KillFast 成功 PID=6116"刷了 54 次，而 6116 就是写日志的
+   进程自己 —— 缓存句柄一旦在别处被关掉，句柄值会被系统复用，下一次 TerminateProcess
+   就打到**别的进程**（甚至自己）身上。每轮 OpenProcess 的成本远小于杀错一个进程。 */
 static BOOL KillFast(DWORD pid)
 {
     static NtSuspendProcess_t s_pSuspend = NULL;
     static NtTerminateProcess_t s_pTerminate = NULL;
     static BOOL s_bTried = FALSE;
-    static DWORD s_dwCachedPid = 0;
-    static HANDLE s_hCached = NULL;
     HANDLE hProc;
     BOOL ok = FALSE;
 
@@ -1796,24 +1797,36 @@ static BOOL KillFast(DWORD pid)
             s_pTerminate = (NtTerminateProcess_t)GetProcAddress(h, "NtTerminateProcess");
         }
     }
-    /* 持久句柄：同一 PID 反复击杀时不再每轮 OpenProcess */
-    if (s_dwCachedPid != pid) {
-        if (s_hCached) { CloseHandle(s_hCached); s_hCached = NULL; }
-        s_hCached = OpenProcess(PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME | SYNCHRONIZE, FALSE, pid);
-        s_dwCachedPid = s_hCached ? pid : 0;
-    }
-    hProc = s_hCached;
+    if (!pid || pid <= 4 || pid == GetCurrentProcessId()) return FALSE;
+
+    hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME | SYNCHRONIZE, FALSE, pid);
+    if (!hProc)
+        hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
     if (!hProc) {
-        hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME, FALSE, pid);
-        if (!hProc) return FALSE;
+        WriteKillLog(L"KillFast 打不开 PID=%lu err=%lu", pid, GetLastError());
+        return FALSE;
     }
 
     if (s_pSuspend) s_pSuspend(hProc);
     if (s_pTerminate) ok = (s_pTerminate(hProc, 0) == 0);
     else ok = TerminateProcess(hProc, 0);
     if (!ok) ok = TerminateProcess(hProc, 0);
-    if (ok) WriteKillLog(L"KillFast 成功（先挂起再终止）PID=%lu", pid);
-    else WriteKillLog(L"KillFast 失败 PID=%lu err=%lu", pid, GetLastError());
+
+    /* **必须等它真的退出**：日志里出现过"KillFast 成功"对同一个 PID 刷几十次，
+       进程却还活着（TerminateProcess 是异步的，且目标被挂起后退出更慢）。
+       不确认就报成功 = 自己骗自己，等于"看起来杀了、其实没杀"。 */
+    if (ok) {
+        DWORD w = WaitForSingleObject(hProc, 300);
+        if (w == WAIT_OBJECT_0) {
+            WriteKillLog(L"KillFast 成功（已确认退出）PID=%lu", pid);
+        } else {
+            WriteKillLog(L"KillFast 已下发但进程仍在 PID=%lu（等 300ms 超时）", pid);
+            ok = FALSE;
+        }
+    } else {
+        WriteKillLog(L"KillFast 失败 PID=%lu err=%lu", pid, GetLastError());
+    }
+    CloseHandle(hProc);
     return ok;
 }
 
@@ -2478,6 +2491,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
+
 
 
 
