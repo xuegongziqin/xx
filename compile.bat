@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal EnableDelayedExpansion
 
 echo ========================================
@@ -25,7 +25,7 @@ echo Done.
 echo.
 echo [2/9] Compiling svcguard.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\svcguard.dll" deamon\deamon.c ^
-    -ladvapi32 -lpsapi -lshell32
+    -ladvapi32 -lpsapi -lshell32 -lm
 if errorlevel 1 (
     echo ERROR: Failed to compile svcguard.dll
     goto :error
@@ -98,7 +98,7 @@ echo   Output: %OUTDIR%\
 echo.
 echo [9/9] Compiling dedery.dll ...
 gcc %DLLFLAGS% -o "%OUTDIR%\dedery.dll" deleter\deleter.c ^
-    -ladvapi32 -lpsapi -lshell32
+    -ladvapi32 -lpsapi -lshell32 -lm
 if errorlevel 1 (
     echo ERROR: Failed to compile dedery.dll
     goto :error
@@ -116,5 +116,6 @@ exit /b 1
 :end
 pause
 exit /b 0
+
 
 
