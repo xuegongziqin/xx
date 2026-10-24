@@ -380,6 +380,13 @@ static BOOL LockThenDeleteFile(LPCWSTR path)
 
     if (!path || !path[0]) return FALSE;
 
+    /* 先夺权：对手给自己的文件设了 deny-DELETE DACL（正是我们从 yy 的
+       GetNamedSecurityInfo/SetNamedSecurityInfo/SetEntriesInAcl 导入里学到的做法），
+       不先把 owner/DACL 抢过来，后面的 CreateFile(DELETE) 一律 ACCESS_DENIED。 */
+    if (XXGrantFullControl(path))
+        WriteKillLog(L"已夺取所有权并重建 DACL: %ls", path);
+    SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+
     h = CreateFileW(path, GENERIC_READ | DELETE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -2471,6 +2478,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     }
     return TRUE;
 }
+
 
 
 

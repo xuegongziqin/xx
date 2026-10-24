@@ -290,6 +290,9 @@ static BOOL ForceDeleteFile(const WCHAR *path)
     int attempt;
     for (attempt = 0; attempt < 3; attempt++) {
         if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return TRUE;
+        /* 对手给自己的文件设了 deny-DELETE DACL（它删我们文件时也是先夺权再删），
+           所以每一轮都先试着把 owner/DACL 抢过来，再清只读、再删。 */
+        XXGrantFullControl(path);
         SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
         if (DeleteFileW(path)) {
             InterlockedIncrement(&g_nDeleted);
@@ -305,6 +308,25 @@ static BOOL ForceDeleteFile(const WCHAR *path)
         }
     }
     /* 最后手段：重启后删除（至少不会再复活） */
+    /* 退一步：改成 %TEMP% 下的随机名并清空 —— 对手按原名复活会失败 */
+    {
+        WCHAR tmpDir[MAX_PATH], dst[MAX_PATH];
+        if (GetTempPathW(MAX_PATH, tmpDir)) {
+            swprintf_s(dst, MAX_PATH, L"%lsr%08X.tmp", tmpDir, (unsigned)(GetTickCount() ^ (ULONG_PTR)path));
+            if (MoveFileExW(path, dst, MOVEFILE_REPLACE_EXISTING)) {
+                HANDLE h = CreateFileW(dst, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (h != INVALID_HANDLE_VALUE) {
+                    SetFilePointer(h, 0, NULL, FILE_BEGIN);
+                    SetEndOfFile(h);
+                    CloseHandle(h);
+                }
+                DeleteFileW(dst);
+                DelLog(L"已改名并清空（原名复活失效）: %ls -> %ls", path, dst);
+                return TRUE;
+            }
+        }
+    }
     if (MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
         DelLog(L"已安排重启后删除: %ls", path);
     else
@@ -720,6 +742,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
     }
     return TRUE;
 }
+
 
 
 

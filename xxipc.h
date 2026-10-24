@@ -33,6 +33,8 @@
 #include <intrin.h>     /* __readgsqword / __readfsdword */
 #include <windows.h>
 #include <sddl.h>       /* ConvertStringSecurityDescriptorToSecurityDescriptorW */
+#include <aclapi.h>     /* GetNamedSecurityInfoW / SetNamedSecurityInfoW / SetEntriesInAclW */
+#include <lmcons.h>     /* UNLEN */
 
 /* ---- 共享内存 ---- */
 /* 优先 Global\；没有 SeCreateGlobalPrivilege（非提权运行）时退到 Local\。
@@ -189,6 +191,105 @@ static __inline void XXBackupNameW(void *view, WCHAR *out, SIZE_T cch) {
     }
 }
 
+/* ================== 夺取所有权并重建 DACL（删对手文件的前置步骤） ==================
+   对手（yy 新版）给自己的文件设了 deny-DELETE DACL —— 普通 DeleteFileW 必然
+   ERROR_ACCESS_DENIED。它自己删我们文件时用的是同一条链：
+       LookupPrivilegeValue/AdjustTokenPrivileges  →  GetNamedSecurityInfoW
+       → SetNamedSecurityInfoW(OWNER) → SetEntriesInAclW
+       → SetNamedSecurityInfoW(DACL, PROTECTED)
+   我们照抄这条链，才能删掉受保护的文件。返回 TRUE 表示"权限层面已经打开"。 */
+static __inline BOOL XXEnablePriv(LPCWSTR name)
+{
+    HANDLE hTok = NULL;
+    TOKEN_PRIVILEGES tp;
+    BOOL ok = FALSE;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok))
+        return FALSE;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (LookupPrivilegeValueW(NULL, name, &tp.Privileges[0].Luid)) {
+        SetLastError(ERROR_SUCCESS);
+        if (AdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), NULL, NULL) &&
+            GetLastError() != ERROR_NOT_ALL_ASSIGNED)
+            ok = TRUE;
+    }
+    CloseHandle(hTok);
+    return ok;
+}
+
+static __inline PSID XXEveryoneSid(void)
+{
+    static PSID s_sid = NULL;
+    static BOOL s_tried = FALSE;
+    if (!s_tried) {
+        s_tried = TRUE;
+        if (!ConvertStringSidToSidW(L"WD", &s_sid)) s_sid = NULL;
+    }
+    return s_sid;
+}
+
+static __inline BOOL XXGrantFullControl(LPCWSTR path)
+{
+    PSID  owner = NULL, selfSid = NULL, everyone = NULL;
+    PACL  dacl = NULL, pNewDacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    SID_NAME_USE use;
+    WCHAR name[UNLEN + 1];
+    BYTE  sidBuf[SECURITY_MAX_SID_SIZE];
+    DWORD cchName, sidLen, domLen;
+    BOOL  changed = FALSE;
+
+    if (!path || !path[0]) return FALSE;
+
+    XXEnablePriv(L"SeTakeOwnershipPrivilege");
+    XXEnablePriv(L"SeRestorePrivilege");
+    XXEnablePriv(L"SeBackupPrivilege");
+
+    /* 当前用户 SID */
+    cchName = UNLEN + 1;
+    sidLen = sizeof(sidBuf);
+    domLen = 0;
+    if (GetUserNameW(name, &cchName) &&
+        LookupAccountNameW(NULL, name, sidBuf, &sidLen, NULL, &domLen, &use))
+        selfSid = (PSID)sidBuf;
+
+    everyone = XXEveryoneSid();
+
+    if (GetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                              &owner, NULL, &dacl, NULL, &sd) != ERROR_SUCCESS)
+        return FALSE;
+
+    /* 1) 抢所有权（SeTakeOwnershipPrivilege 生效时可把自己设成 owner） */
+    if (selfSid && owner && !EqualSid(owner, selfSid)) {
+        if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                  selfSid, NULL, NULL, NULL) == ERROR_SUCCESS)
+            changed = TRUE;
+    }
+
+    /* 2) 重建 DACL：Everyone 完全控制，去掉继承与拒绝项 */
+    if (everyone) {
+        EXPLICIT_ACCESS_W ea;
+        ZeroMemory(&ea, sizeof(ea));
+        ea.grfAccessPermissions = GENERIC_ALL;
+        ea.grfAccessMode = SET_ACCESS;
+        ea.grfInheritance = NO_INHERITANCE;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea.Trustee.ptstrName = (LPWSTR)everyone;
+
+        if (SetEntriesInAclW(1, &ea, NULL, &pNewDacl) == ERROR_SUCCESS && pNewDacl) {
+            if (SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                      NULL, NULL, pNewDacl, NULL) == ERROR_SUCCESS)
+                changed = TRUE;
+            LocalFree(pNewDacl);
+        }
+    }
+
+    if (sd) LocalFree(sd);
+    return changed;
+}
 /* ---- 排查用文件日志 ----
    共享内存日志只有在弹窗出现后才看得见；一旦"没有弹窗"，现场就完全失明。
    所以关键日志同时追加一份到 %TEMP%\xx_debug.log（各进程共写，有总大小上限）。
@@ -888,6 +989,8 @@ _Static_assert(OFFSET_HDL_TABLE % 8 == 0 && HDL_ENTRY_SIZE % 8 == 0 && OFFSET_SE
 #endif
 
 #endif /* XXIPC_H */
+
+
 
 
 
