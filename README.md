@@ -64,9 +64,9 @@ xx.exe
 ├── xx/                  # xx.exe 主程序
 ├── deamon/              # svcguard.dll
 ├── window/              # window.dll
-├── killtools/           # atkcore.dll
+├── killtools/           # atkcore.dll（parts/ 里是宿主化+WMI 片段）
 ├── dedery/              # 守护注入的额外模块
-├── deleter/             # dedery.dll（全盘清道夫）
+├── deleter/             # dedery.dll（parts/ 里是模糊识别、目录监听片段）
 ├── killer/              # payload.dll + payload.asm
 ├── guard/               # guard.dll
 ├── defense/             # defense.dll
@@ -112,11 +112,11 @@ compile.bat
 
 ## 5. 二进制清单（规则第 5 条要求公开）
 
-`bin\` 目录下的全部交付物（合计 **358,162** 字节）：
+`bin\` 目录下的全部交付物（合计 **362,258** 字节）：
 
 | 文件 | 大小 | 说明 |
 | --- | ---: | --- |
-| `xx.exe` | 85,504 | 主程序 |
+| `xx.exe` | 89,600 | 主程序（**服务双入口**：`--svc install/run/uninstall`，可拿 SYSTEM） |
 | `svcguard.dll` | 40,960 | 守护与扩散 |
 | `window.dll` | 34,304 | 弹窗与日志 |
 | `atkcore.dll` | 72,192 | 攻击工具箱（含宿主化与自证；细节不公开） |
